@@ -1,0 +1,73 @@
+[
+  {
+    "number": 1,
+    "title": "Set up CI pipeline",
+    "body": "Configure GitHub Actions for the project.",
+    "state": "open",
+    "created_days_ago": 10,
+    "assignees": [],
+    "labels": ["story"],
+    "milestone": "Sprint 1"
+  },
+  {
+    "number": 2,
+    "title": "Build login form",
+    "body": "Username + password form with validation.",
+    "state": "open",
+    "created_days_ago": 8,
+    "assignees": ["alice"],
+    "labels": ["story", "status: in-progress"],
+    "milestone": "Sprint 1"
+  },
+  {
+    "number": 3,
+    "title": "Wire up auth API",
+    "body": "Backend endpoints for login/logout.",
+    "state": "open",
+    "created_days_ago": 9,
+    "assignees": ["bob"],
+    "labels": ["story", "status: in-progress"],
+    "milestone": "Sprint 1"
+  },
+  {
+    "number": 4,
+    "title": "Add login page styling",
+    "body": "CSS for the login page.",
+    "state": "open",
+    "created_days_ago": 7,
+    "assignees": ["carol"],
+    "labels": ["story"],
+    "milestone": "Sprint 1"
+  },
+  {
+    "number": 5,
+    "title": "Project scaffolding",
+    "body": "Initial repo layout and tooling.",
+    "state": "closed",
+    "created_days_ago": 14,
+    "assignees": ["dave"],
+    "labels": ["story", "status: done"],
+    "milestone": "Sprint 1"
+  },
+  {
+    "number": 6,
+    "title": "Spike: evaluate caching libraries",
+    "body": "Closed as a duplicate of #2's caching note.",
+    "state": "closed",
+    "created_days_ago": 12,
+    "assignees": ["dave"],
+    "labels": ["story"],
+    "milestone": "Sprint 1"
+  },
+  {
+    "number": 101,
+    "title": "Add login page styling",
+    "body": "Closes #4",
+    "state": "open",
+    "created_days_ago": 8,
+    "assignees": ["carol"],
+    "labels": [],
+    "milestone": "Sprint 1",
+    "is_pull_request": true
+  }
+]

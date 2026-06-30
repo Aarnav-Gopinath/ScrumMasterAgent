@@ -1,0 +1,8 @@
+repo_name: "your-org/your-repo"
+staleness_days: 2
+business_days_only: true
+sprint_milestone: "Sprint 1"
+standup_issue_number: 1          # create one issue titled "Daily Standup" first
+completion_labels:               # labels a story must have to count as properly done
+  - "status: done"
+slack_webhook_url: ""            # leave empty for POC

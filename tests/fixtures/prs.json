@@ -1,0 +1,9 @@
+[
+  {
+    "number": 101,
+    "title": "Add login page styling",
+    "body": "Closes #4 — adds the CSS for the login page.",
+    "state": "open",
+    "created_days_ago": 8
+  }
+]

@@ -1,0 +1,16 @@
+# Secrets — never commit
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+venv/
+.venv/
+
+# Agent runtime memory (committed by Actions in production, ignored locally)
+agent-state.json
+
+# macOS
+.DS_Store

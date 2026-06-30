@@ -1,0 +1,17 @@
+[
+  {
+    "sha": "a1b2c3d",
+    "message": "implement login form fields #2",
+    "date_days_ago": 1
+  },
+  {
+    "sha": "e4f5g6h",
+    "message": "wip: stub auth endpoints #3",
+    "date_days_ago": 6
+  },
+  {
+    "sha": "i7j8k9l",
+    "message": "chore: fix a typo in README",
+    "date_days_ago": 0
+  }
+]
