@@ -10,6 +10,8 @@ completion.
 
 from __future__ import annotations
 
+import json
+import os
 import sys
 from datetime import datetime, timezone
 
@@ -19,10 +21,15 @@ from agent.services.fixtures import FixtureRepo
 from agent.services.github_client import GitHubClient
 from agent.services.metrics import build_activity_snapshot, infer_status
 from agent.services.state import load_state
-from agent.subagents import staleness
+from agent.subagents import completion, pr_watcher, reporter, staleness
 
 FIXTURE_PATH = "tests/fixtures"
 DEMO_STATE_PATH = ".demo-state.json"
+
+
+def _load_event(name: str) -> dict:
+    with open(os.path.join(FIXTURE_PATH, name), "r", encoding="utf-8") as fh:
+        return json.load(fh)
 
 
 def _client(now: datetime) -> GitHubClient:
@@ -85,10 +92,48 @@ def demo_staleness(now: datetime) -> None:
     print(f"\nState saved to {DEMO_STATE_PATH} — run again to see no double-reminders.")
 
 
+def demo_standup(now: datetime) -> None:
+    """Run the Standup Reporter. Without ANTHROPIC_API_KEY set, llm.py returns its
+    deterministic fallback digest — so this works fully offline."""
+    config = load_config()
+    client = _client(now)
+    body = reporter.run(client, config, now)
+    print("Standup digest that would be posted to "
+          f"issue #{config.standup_issue_number}:\n")
+    print(body)
+
+
+def demo_pr_watcher(now: datetime) -> None:
+    """Feed the PR-opened event fixture through the PR watcher."""
+    config = load_config()
+    client = _client(now)
+    event = _load_event("event_pr_opened.json")
+    summary = pr_watcher.run(client, config, event)
+    for number, action in summary:
+        print(f"  issue #{number}: {action}")
+    _print_captured(client)
+
+
+def demo_completion(now: datetime) -> None:
+    """Feed the issue-closed event fixture through the completion checker.
+
+    Fixture #6 is closed without the `status: done` label and no linked PR, so it
+    gets flagged."""
+    config = load_config()
+    client = _client(now)
+    event = _load_event("event_issue_closed.json")
+    number, action = completion.run(client, config, event)
+    print(f"  issue #{number}: {action}")
+    _print_captured(client)
+
+
 MODES = {
     "issues": demo_issues,
     "status": demo_status,
     "staleness": demo_staleness,
+    "standup": demo_standup,
+    "pr_watcher": demo_pr_watcher,
+    "completion": demo_completion,
 }
 
 

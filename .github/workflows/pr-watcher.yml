@@ -1,0 +1,32 @@
+name: PR Review Watcher
+
+# Fires when a PR is opened or marked ready for review. Notes the review on the
+# referenced issue.
+on:
+  pull_request:
+    types: [opened, ready_for_review]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  pr_watcher:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run PR watcher
+        env:
+          AGENT_MODE: pr_watcher
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # GITHUB_EVENT_PATH is provided automatically by Actions and points at the
+        # pull_request event payload the orchestrator reads.
+        run: python -m agent.orchestrator

@@ -1,0 +1,30 @@
+name: Standup Reporter
+
+# Daily at 09:15 UTC, weekdays. Posts the natural-language standup digest.
+on:
+  schedule:
+    - cron: "15 9 * * 1-5"
+  workflow_dispatch: {}
+
+permissions:
+  issues: write
+
+jobs:
+  standup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Post standup digest
+        env:
+          AGENT_MODE: standup
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python -m agent.orchestrator
