@@ -12,6 +12,7 @@ permissions:
 
 jobs:
   pr_watcher:
+    if: github.repository_owner == 'UST-PACE'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
