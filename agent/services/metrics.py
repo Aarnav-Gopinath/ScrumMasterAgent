@@ -47,7 +47,20 @@ def _is_agent_comment(comment) -> bool:
     return AGENT_COMMENT_MARKER in (getattr(comment, "body", "") or "")
 
 
-def build_activity_snapshot(client: GitHubClient, story: Story) -> ActivitySnapshot:
+def is_repo_abandoned(
+    last_activity: datetime | None, now: datetime, abandoned_days: int = 30
+) -> bool:
+    """True if repo has no activity or last activity is older than abandoned_days."""
+    if last_activity is None:
+        return True
+    return (now - last_activity).days > abandoned_days
+
+
+def build_activity_snapshot(
+    client: GitHubClient,
+    story: Story,
+    repo=None,
+) -> ActivitySnapshot:
     """Tally commits, PRs, and comments linked to `story`.
 
     GitHub has no native commit-to-issue API, so activity is inferred from "#<number>"
@@ -58,19 +71,38 @@ def build_activity_snapshot(client: GitHubClient, story: Story) -> ActivitySnaps
     """
     ref = f"#{story.number}"
 
-    commits = client.search_commits(ref)
-    prs = client.search_prs(ref)
+    message_commits = client.search_commits(repo, ref) if repo is not None else client.search_commits(ref)
+    branch_commits = (
+        client.search_issue_branch_commits(story.number, repo)
+        if repo is not None
+        else client.search_issue_branch_commits(story.number)
+    )
+    commits_by_sha = {commit.sha: commit for commit in [*message_commits, *branch_commits]}
+
+    prs = client.search_prs(repo, ref) if repo is not None else client.search_prs(ref)
+    prs_by_number = {pr.number: pr for pr in prs}
     # Exclude the agent's own comments so a staleness reminder isn't mistaken for
     # developer activity on the next run.
-    comments = [c for c in client.get_comments(story.number) if not _is_agent_comment(c)]
+    comments = (
+        client.get_comments(repo, story.number)
+        if repo is not None
+        else client.get_comments(story.number)
+    )
+    filtered_comments = [c for c in comments if not _is_agent_comment(c)]
+    comments_by_id = {
+        getattr(comment, "id", idx): comment
+        for idx, comment in enumerate(filtered_comments)
+    }
 
     return ActivitySnapshot(
-        last_commit_at=_max_date([c.date for c in commits]),
-        last_pr_at=_max_date([p.created_at for p in prs]),
-        last_comment_at=_max_date([getattr(c, "created_at", None) for c in comments]),
-        commit_count=len(commits),
-        pr_count=len(prs),
-        comment_count=len(comments),
+        last_commit_at=_max_date([c.date for c in commits_by_sha.values()]),
+        last_pr_at=_max_date([p.created_at for p in prs_by_number.values()]),
+        last_comment_at=_max_date(
+            [getattr(c, "created_at", None) for c in comments_by_id.values()]
+        ),
+        commits_unique_count=len(commits_by_sha),
+        prs_unique_count=len(prs_by_number),
+        comments_unique_count=len(comments_by_id),
     )
 
 
@@ -93,7 +125,7 @@ def infer_status(
     if story.is_closed:
         return StoryStatus.DONE
 
-    if snapshot.pr_count > 0:
+    if snapshot.prs_unique_count > 0:
         return StoryStatus.IN_REVIEW
 
     if not story.has_assignee:

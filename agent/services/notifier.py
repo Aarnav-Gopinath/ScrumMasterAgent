@@ -25,16 +25,19 @@ class Notifier:
     def __init__(self, client: GitHubClient):
         self.client = client
 
-    def post_comment(self, issue_number: int, body: str):
+    def post_comment(self, issue_number: int, body: str, repo=None):
         """Post a comment on an issue and return the created comment object.
 
         The hidden AGENT_COMMENT_MARKER is appended so activity detection can later
         exclude the agent's own comments.
         """
         logger.info("Posting comment on #%s", issue_number)
-        return self.client.post_comment(issue_number, f"{body}\n\n{AGENT_COMMENT_MARKER}")
+        comment_body = f"{body}\n\n{AGENT_COMMENT_MARKER}"
+        if repo is None:
+            return self.client.post_comment(issue_number, comment_body)
+        return self.client.post_comment(repo, issue_number, comment_body)
 
-    def remind_assignee(self, story: Story, days_stale: int):
+    def remind_assignee(self, story: Story, days_stale: int, repo=None):
         """Nudge a stale story.
 
         If it has assignees, @mention each by login with a friendly note. If it has no
@@ -53,7 +56,26 @@ class Notifier:
                 f"{days_stale} {unit}) and has **no assignee**. It likely needs to be "
                 f"picked up or triaged."
             )
-        return self.post_comment(story.number, body)
+        return self.post_comment(story.number, body, repo=repo)
+
+    def ask_committers_for_status(
+        self,
+        repo,
+        story: Story,
+        committers: list[str],
+        days_stale: int,
+    ) -> None:
+        """Ask known branch committers whether stale work is still active."""
+        if not committers:
+            self.remind_assignee(story, days_stale, repo=repo)
+            return
+
+        mentions = " ".join(f"@{login}" for login in committers)
+        body = (
+            f"Hey {mentions} — this issue hasn't had any activity in **{days_stale} days**. "
+            "Could you let us know: is this still in progress, or is it ready to close? Thanks!"
+        )
+        self.post_comment(story.number, body, repo=repo)
 
     def post_to_slack(self, text: str):
         """Post to Slack — NOT IMPLEMENTED for the POC.

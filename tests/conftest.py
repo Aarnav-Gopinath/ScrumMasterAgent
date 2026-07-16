@@ -57,18 +57,18 @@ def make_story(
 def make_snapshot(
     *,
     last_activity_days_ago: int | None = None,
-    pr_count: int = 0,
-    commit_count: int = 0,
-    comment_count: int = 0,
+    prs_unique_count: int = 0,
+    commits_unique_count: int = 0,
+    comments_unique_count: int = 0,
 ) -> ActivitySnapshot:
     """Build a snapshot whose most-recent activity is `last_activity_days_ago` before
     NOW (None means no activity at all)."""
     stamp = None if last_activity_days_ago is None else NOW - timedelta(days=last_activity_days_ago)
     return ActivitySnapshot(
         last_commit_at=stamp,
-        last_pr_at=stamp if pr_count else None,
+        last_pr_at=stamp if prs_unique_count else None,
         last_comment_at=None,
-        commit_count=commit_count,
-        pr_count=pr_count,
-        comment_count=comment_count,
+        commits_unique_count=commits_unique_count,
+        prs_unique_count=prs_unique_count,
+        comments_unique_count=comments_unique_count,
     )
