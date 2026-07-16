@@ -25,8 +25,8 @@ def test_standup_posts_to_configured_issue(client, monkeypatch):
     assert len(posted) == 1
     assert posted[0]["issue_number"] == config.standup_issue_number
     assert "Daily Standup" in body
-    # #3 is the stalled story — it must surface in the digest / needs-attention list.
-    assert "#3" in body
+    # #42 is the stalled story — it must surface in the digest / needs-attention list.
+    assert "#42" in body
     assert "Needs attention" in body
 
 

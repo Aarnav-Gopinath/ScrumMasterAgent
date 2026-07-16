@@ -18,7 +18,7 @@ def test_fallback_used_without_api_key(monkeypatch):
 
     data = [
         (_story(2, "Login form", ["alice"]), StoryStatus.IN_PROGRESS,
-         ActivitySnapshot(last_commit_at=NOW - timedelta(days=1), commit_count=2)),
+         ActivitySnapshot(last_commit_at=NOW - timedelta(days=1), commits_unique_count=2)),
         (_story(3, "Auth API", ["bob"]), StoryStatus.STALLED, ActivitySnapshot()),
     ]
 

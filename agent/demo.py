@@ -11,20 +11,25 @@ completion.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 from datetime import datetime, timezone
 
-from agent.models import Story
+from dotenv import load_dotenv
+
+from agent.models import Story, StoryStatus
 from agent.services.config import load_config
 from agent.services.fixtures import FixtureRepo
 from agent.services.github_client import GitHubClient
-from agent.services.metrics import build_activity_snapshot, infer_status
+from agent.services.metrics import build_activity_snapshot, infer_status, is_repo_abandoned
+from agent.services.notifier import AGENT_COMMENT_MARKER, Notifier
 from agent.services.state import load_state
 from agent.subagents import completion, pr_watcher, reporter, staleness
 
 FIXTURE_PATH = "tests/fixtures"
 DEMO_STATE_PATH = ".demo-state.json"
+logger = logging.getLogger(__name__)
 
 
 def _load_event(name: str) -> dict:
@@ -38,10 +43,9 @@ def _client(now: datetime) -> GitHubClient:
 
 def demo_issues(now: datetime) -> None:
     """List every fixture issue mapped to a Story (proves loader + injection)."""
-    config = load_config()
     client = _client(now)
-    print(f"Open issues in milestone '{config.sprint_milestone}':\n")
-    for issue in client.get_open_issues(config.sprint_milestone):
+    print("Open issues:\n")
+    for issue in client.get_open_issues():
         story = Story.from_issue(issue)
         who = ", ".join(story.assignees) if story.assignees else "(unassigned)"
         print(f"  #{story.number:<3} {story.title:<32} assignees: {who}")
@@ -51,20 +55,43 @@ def demo_status(now: datetime) -> None:
     """Classify every story in the sprint (closed included) — all 5 statuses fire."""
     config = load_config()
     client = _client(now)
-    print(f"Story statuses in milestone '{config.sprint_milestone}':\n")
-    for issue in client.get_issues(config.sprint_milestone, state="all"):
+    repo = client.repo
+    last_activity = client.get_last_repo_activity(repo)
+    abandoned = is_repo_abandoned(last_activity, now, config.abandoned_days)
+    activity_note = (
+        "no commits found"
+        if last_activity is None
+        else f"last commit: {last_activity.date().isoformat()}"
+    )
+    print(
+        "Fixture repo status:\n"
+        f"  abandoned={abandoned} ({activity_note}, threshold={config.abandoned_days} days)\n"
+    )
+
+    print("Story statuses across all issues:\n")
+    for issue in client.get_issues(state="all", repo=repo):
         story = Story.from_issue(issue)
-        snapshot = build_activity_snapshot(client, story)
+        snapshot = build_activity_snapshot(client, story, repo=repo)
         status = infer_status(
             story, snapshot, config.staleness_days, config.business_days_only, now
         )
         gap = snapshot.last_activity_at
         gap_str = gap.date().isoformat() if gap else "no activity"
+        stalled_committers = (
+            client.get_branch_committers(repo, story.number)
+            if status is StoryStatus.STALLED
+            else []
+        )
         print(
             f"  #{story.number:<3} {status.value:<12} {story.title:<32} "
-            f"(last activity: {gap_str}, commits={snapshot.commit_count} "
-            f"prs={snapshot.pr_count} comments={snapshot.comment_count})"
+            f"(last activity: {gap_str}, commits={snapshot.commits_unique_count} "
+            f"prs={snapshot.prs_unique_count} comments={snapshot.comments_unique_count})"
         )
+        if status is StoryStatus.STALLED:
+            if stalled_committers:
+                print(f"       committers to contact: {', '.join(stalled_committers)}")
+            else:
+                print("       committers to contact: (none, fallback to assignee)")
 
 
 def _print_captured(client: GitHubClient) -> None:
@@ -97,7 +124,7 @@ def demo_standup(now: datetime) -> None:
     deterministic fallback digest — so this works fully offline."""
     config = load_config()
     client = _client(now)
-    body = reporter.run(client, config, now)
+    body = reporter.run(client, config, now, jira_client=None)
     print("Standup digest that would be posted to "
           f"issue #{config.standup_issue_number}:\n")
     print(body)
@@ -127,6 +154,127 @@ def demo_completion(now: datetime) -> None:
     _print_captured(client)
 
 
+class _DryRunNotifier(Notifier):
+    def __init__(self, client: GitHubClient, repo_full_name: str):
+        super().__init__(client)
+        self.repo_full_name = repo_full_name
+
+    def post_comment(self, issue_number: int, body: str, repo=None):
+        comment_body = f"{body}\n\n{AGENT_COMMENT_MARKER}"
+        target_repo = (
+            getattr(repo, "full_name", self.repo_full_name)
+            if repo is not None
+            else self.repo_full_name
+        )
+        print(
+            f"DRY RUN — would post to issue #{issue_number} in {target_repo}:\n"
+            f"{comment_body}\n"
+        )
+        return {
+            "issue_number": issue_number,
+            "body": comment_body,
+            "repo": target_repo,
+            "dry_run": True,
+        }
+
+
+def _run_live_mode(mode: str, now: datetime) -> int:
+    load_dotenv()
+    config = load_config()
+    token = os.environ.get("GITHUB_TOKEN")
+    org_client = GitHubClient.from_org_token(token=token, org_name=config.org_name)
+    repo_cap = 20 if mode == "staleness" else None
+    repos = org_client.get_org_repos(exclude_repo=config.agent_repo, max_repos=repo_cap)
+
+    if not repos:
+        print("No repos found after exclusions.")
+        return 1
+
+    if mode == "staleness":
+        print(
+            "DEMO MODE: scanning first 20 repos only.\n"
+            "Remove max_repos cap for full org scan."
+        )
+
+    print(
+        f"Live dry-run mode for {len(repos)} repo(s) in org {config.org_name} "
+        f"(excluding {config.agent_repo})."
+    )
+
+    event_payload = {}
+    event_path = os.environ.get("GITHUB_EVENT_PATH")
+    if event_path and os.path.exists(event_path):
+        with open(event_path, "r", encoding="utf-8") as fh:
+            event_payload = json.load(fh)
+
+    for repo in repos:
+        repo_name = getattr(repo, "full_name", getattr(repo, "name", "unknown-repo"))
+        print(f"\n=== {repo_name} ===")
+        repo_client = GitHubClient(repo)
+        notifier = _DryRunNotifier(repo_client, repo_name)
+        if mode == "staleness":
+            last_activity = org_client.get_last_repo_activity(repo)
+            if is_repo_abandoned(last_activity, now, config.abandoned_days):
+                if last_activity is None:
+                    print(
+                        f"Skipping {repo_name} — no activity in over {config.abandoned_days} days"
+                    )
+                else:
+                    print(f"Skipping {repo_name} — no activity in {(now - last_activity).days} days")
+                continue
+
+            summary: list[tuple[int, str]] = []
+            for issue in repo_client.get_open_issues(repo):
+                story = Story.from_issue(issue)
+                snapshot = build_activity_snapshot(repo_client, story, repo=repo)
+                status = infer_status(
+                    story, snapshot, config.staleness_days, config.business_days_only, now
+                )
+                if status is not StoryStatus.STALLED:
+                    summary.append((story.number, f"skip:{status.value}"))
+                    continue
+
+                committers = repo_client.get_branch_committers(repo, story.number)
+                if committers:
+                    notifier.ask_committers_for_status(
+                        repo, story, committers, config.staleness_days
+                    )
+                    summary.append((story.number, "dry-run:committers"))
+                    print(
+                        f"DRY RUN outreach targets for #{story.number}: "
+                        f"{', '.join(committers)}"
+                    )
+                else:
+                    notifier.remind_assignee(story, config.staleness_days, repo=repo)
+                    summary.append((story.number, "dry-run:assignee"))
+                    print(
+                        f"DRY RUN outreach targets for #{story.number}: "
+                        "(none found, fallback to assignee)"
+                    )
+            print(f"summary: {summary}")
+        elif mode == "standup":
+            body = reporter.run(
+                repo_client,
+                config,
+                now=now,
+                notifier=notifier,
+            )
+            print(body)
+        elif mode == "pr_watcher":
+            if event_payload:
+                summary = pr_watcher.run(repo_client, config, event_payload, notifier=notifier)
+            else:
+                summary = pr_watcher.check_stale_prs(repo_client, config, now, notifier=notifier)
+            print(f"summary: {summary}")
+        elif mode == "completion":
+            result = completion.run(repo_client, config, event_payload, notifier=notifier)
+            print(f"result: {result}")
+        else:
+            logger.warning("Unknown live mode %s", mode)
+            return 2
+    return 0
+
+
 MODES = {
     "issues": demo_issues,
     "status": demo_status,
@@ -138,6 +286,14 @@ MODES = {
 
 
 def main(argv: list[str]) -> int:
+    if len(argv) >= 2 and argv[0] == "live":
+        live_mode = argv[1]
+        if live_mode not in {"staleness", "standup", "pr_watcher", "completion"}:
+            print("usage: python -m agent.demo live <staleness|standup|pr_watcher|completion>")
+            return 2
+        now = datetime.now(timezone.utc)
+        return _run_live_mode(live_mode, now)
+
     if len(argv) < 1 or argv[0] not in MODES:
         print(f"usage: python -m agent.demo <{'|'.join(MODES)}>")
         return 2

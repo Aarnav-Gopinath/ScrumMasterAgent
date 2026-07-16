@@ -1,6 +1,6 @@
 """Standup Reporter sub-agent (cron, every morning).
 
-Aggregates the sprint's stories, infers each one's status, asks Claude for a natural-
+Aggregates stories, infers each one's status, asks Claude for a natural-
 language digest (via services.llm), and posts it to the configured standup issue.
 
 This is the only sub-agent that spends LLM tokens — and it skips the call entirely when
@@ -16,6 +16,7 @@ from typing import Optional
 from agent.models import Story, StoryStatus
 from agent.services.config import Config
 from agent.services.github_client import GitHubClient
+from agent.services.jira_client import JiraClient
 from agent.services.llm import generate_standup_summary
 from agent.services.metrics import build_activity_snapshot, infer_status
 from agent.services.notifier import Notifier
@@ -36,15 +37,17 @@ def run(
     config: Config,
     now: datetime,
     notifier: Optional[Notifier] = None,
+    jira_client: Optional[JiraClient] = None,
 ) -> str:
     """Build and post the daily standup digest. Returns the posted body (for logging).
 
-    Considers open *and* recently-closed issues in the sprint milestone so the digest
+    Considers open *and* recently-closed issues so the digest
     can celebrate what just landed, not only what's in flight.
     """
+    _ = jira_client  # reserved for Session 2 Jira discrepancy reporting
     notifier = notifier or Notifier(client)
 
-    issues = client.get_issues(config.sprint_milestone, state="all")
+    issues = client.get_issues(state="all")
     stories_with_status = []
     for issue in issues:
         story = Story.from_issue(issue)

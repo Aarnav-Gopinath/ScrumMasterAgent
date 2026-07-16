@@ -1,6 +1,6 @@
 # Scrum Master Agent
 
-A GitHub-native Scrum Master agent. It watches a sprint's issues and PRs and, on a
+A GitHub-native Scrum Master agent. It watches issues and PRs and, on a
 schedule or in response to events, nudges stale stories, posts a natural-language
 standup digest, flags PRs waiting for review, and catches issues closed without meeting
 the definition of done.
@@ -37,15 +37,39 @@ exposes the same surface, so every code path runs with **zero network access**.
 python -m venv venv
 source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env              # then fill in GITHUB_TOKEN and ANTHROPIC_API_KEY
+cp .env.example .env              # then fill in credentials
 ```
 
-Run a sub-agent against a real repo (configured in `config.yml`):
+Run a sub-agent:
 
 ```bash
 AGENT_MODE=staleness python -m agent.orchestrator
 AGENT_MODE=standup   python -m agent.orchestrator
 ```
+
+## Running against UST-PACE
+
+Populate `.env` with:
+
+- `GITHUB_TOKEN`
+- `ANTHROPIC_API_KEY`
+- `JIRA_BASE_URL`
+- `JIRA_EMAIL`
+- `JIRA_API_TOKEN`
+
+`GITHUB_TOKEN` should be a fine-grained PAT scoped to UST-PACE with repository and organization read permissions.
+
+The agent monitors **all open issues across all repos** in the org (excluding its own repo), so no milestone configuration is required.
+
+Commands:
+
+```bash
+python -m agent.demo staleness       # fixture demo
+python -m agent.demo live staleness  # live org-wide dry run
+pytest -m live                        # live smoke tests only
+```
+
+⚠️ Warning: disabling dry-run behavior will post real comments on real issues across UST-PACE repos.
 
 ### Offline demo (no tokens, no network)
 
@@ -73,14 +97,15 @@ All logic tests run offline via `FixtureRepo` — no GitHub credentials required
 Edit `config.yml`:
 
 ```yaml
-repo_name: "your-org/your-repo"
+org_name: "UST-PACE"
+agent_repo: "UST-PACE/scrum-master-agent"
 staleness_days: 2
 business_days_only: true          # weekends don't count toward staleness
-sprint_milestone: "Sprint 1"
 standup_issue_number: 1           # create an issue titled "Daily Standup" first
 completion_labels:
   - "status: done"
 slack_webhook_url: ""             # unused in the POC
+jira_base_url: ""                 # optional, falls back to JIRA_BASE_URL env var
 ```
 
 ### Team conventions the agent depends on

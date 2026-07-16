@@ -51,9 +51,23 @@ class _CommitDetail:
 
 
 class FixtureCommit:
-    def __init__(self, sha: str, message: str, date: Optional[datetime]):
+    def __init__(
+        self,
+        sha: str,
+        message: str,
+        date: Optional[datetime],
+        author_login: Optional[str] = None,
+    ):
         self.sha = sha
         self.commit = _CommitDetail(message, date)
+        self.author = _User(author_login) if author_login else None
+
+
+class FixtureBranch:
+    def __init__(self, name: str, commit_sha: Optional[str] = None):
+        self.name = name
+        # Minimal shape to match PyGitHub's branch.commit.sha
+        self.commit = type("BranchCommit", (), {"sha": commit_sha})()
 
 
 class FixturePull:
@@ -66,9 +80,10 @@ class FixturePull:
 
 
 class FixtureComment:
-    def __init__(self, body: str, created_at: Optional[datetime]):
+    def __init__(self, body: str, created_at: Optional[datetime], comment_id: Optional[int] = None):
         self.body = body
         self.created_at = created_at
+        self.id = comment_id
 
 
 class FixtureIssue:
@@ -106,6 +121,9 @@ class FixtureRepo:
     def __init__(self):
         self._issues: dict[int, FixtureIssue] = {}
         self._commits: list[FixtureCommit] = []
+        self._commits_by_sha: dict[str, FixtureCommit] = {}
+        self._branches: list[FixtureBranch] = []
+        self._branch_commits: dict[str, list[FixtureCommit]] = {}
         self._pulls: list[FixturePull] = []
         self.posted_comments: list[dict] = []  # captured writes
 
@@ -120,13 +138,29 @@ class FixtureRepo:
             repo._issues[issue.number] = issue
 
         for data in _read_json(os.path.join(path, "commits.json")):
-            repo._commits.append(
-                FixtureCommit(
-                    sha=data["sha"],
-                    message=data.get("message", ""),
-                    date=_resolve(data.get("date_days_ago"), now),
+            commit = FixtureCommit(
+                sha=data["sha"],
+                message=data.get("message", ""),
+                date=_resolve(data.get("date_days_ago"), now),
+                author_login=data.get("author_login"),
+            )
+            repo._commits.append(commit)
+            repo._commits_by_sha[commit.sha] = commit
+
+        for data in _read_json(os.path.join(path, "branches.json")):
+            branch_name = data["name"]
+            commit_shas = data.get("commit_shas", [])
+            repo._branches.append(
+                FixtureBranch(
+                    name=branch_name,
+                    commit_sha=commit_shas[0] if commit_shas else None,
                 )
             )
+            repo._branch_commits[branch_name] = [
+                repo._commits_by_sha[sha]
+                for sha in commit_shas
+                if sha in repo._commits_by_sha
+            ]
 
         for data in _read_json(os.path.join(path, "prs.json")):
             repo._pulls.append(
@@ -139,13 +173,14 @@ class FixtureRepo:
                 )
             )
 
-        for data in _read_json(os.path.join(path, "comments.json")):
+        for idx, data in enumerate(_read_json(os.path.join(path, "comments.json")), start=1):
             issue = repo._issues.get(data["issue_number"])
             if issue is not None:
                 issue._comments.append(
                     FixtureComment(
                         body=data.get("body", ""),
                         created_at=_resolve(data.get("created_days_ago"), now),
+                        comment_id=data.get("id", idx),
                     )
                 )
 
@@ -161,8 +196,15 @@ class FixtureRepo:
     def get_issue(self, number: int) -> FixtureIssue:
         return self._issues[number]
 
-    def get_commits(self):
-        return list(self._commits)
+    def get_commits(self, sha: Optional[str] = None):
+        if sha is None:
+            return list(self._commits)
+        if sha in self._branch_commits:
+            return list(self._branch_commits[sha])
+        return []
+
+    def get_branches(self):
+        return list(self._branches)
 
     def get_pulls(self, state: str = "all"):
         if state == "all":

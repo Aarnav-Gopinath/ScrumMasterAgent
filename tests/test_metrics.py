@@ -11,6 +11,7 @@ from agent.services.metrics import (
     build_activity_snapshot,
     business_days_between,
     infer_status,
+    is_repo_abandoned,
 )
 from tests.conftest import NOW, make_snapshot, make_story
 
@@ -31,7 +32,7 @@ def test_closed_issue_is_done():
 
 def test_open_with_linked_pr_is_in_review():
     story = make_story(assignees=["alice"])
-    snapshot = make_snapshot(pr_count=1, last_activity_days_ago=1)
+    snapshot = make_snapshot(prs_unique_count=1, last_activity_days_ago=1)
     assert (
         infer_status(story, snapshot, STALENESS_DAYS, business_days_only=True, now=NOW)
         == StoryStatus.IN_REVIEW
@@ -111,15 +112,38 @@ def test_business_days_zero_when_end_not_after_start():
 
 
 def test_snapshot_links_commits_by_reference(client):
-    story = Story.from_issue(client.get_issue(2))  # commit references #2
+    story = Story.from_issue(client.get_issue(42))
     snapshot = build_activity_snapshot(client, story)
-    assert snapshot.commit_count == 1
-    assert snapshot.pr_count == 0
+    # One SHA is discovered from both message and branch scans and must be deduplicated.
+    assert snapshot.commits_unique_count == 3
+    assert snapshot.prs_unique_count == 0
     assert snapshot.last_activity_at is not None
+
+
+def test_snapshot_counts_multiple_message_references(client):
+    story = Story.from_issue(client.get_issue(2))
+    snapshot = build_activity_snapshot(client, story)
+    assert snapshot.commits_unique_count == 2
 
 
 def test_snapshot_links_pr_by_reference(client):
     story = Story.from_issue(client.get_issue(4))  # PR references #4
     snapshot = build_activity_snapshot(client, story)
-    assert snapshot.pr_count == 1
-    assert snapshot.comment_count == 1
+    assert snapshot.prs_unique_count == 1
+    assert snapshot.comments_unique_count == 1
+
+
+def test_is_repo_abandoned_when_last_activity_missing(now):
+    assert is_repo_abandoned(None, now, abandoned_days=30) is True
+
+
+def test_is_repo_abandoned_when_gap_exceeds_threshold(now):
+    assert is_repo_abandoned(now - timedelta(days=31), now, abandoned_days=30) is True
+
+
+def test_is_repo_not_abandoned_inside_threshold(now):
+    assert is_repo_abandoned(now - timedelta(days=29), now, abandoned_days=30) is False
+
+
+def test_is_repo_not_abandoned_when_activity_is_today(now):
+    assert is_repo_abandoned(now, now, abandoned_days=30) is False

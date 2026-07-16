@@ -76,9 +76,22 @@ class ActivitySnapshot:
     last_commit_at: Optional[datetime] = None
     last_pr_at: Optional[datetime] = None
     last_comment_at: Optional[datetime] = None
-    commit_count: int = 0
-    pr_count: int = 0
-    comment_count: int = 0
+    commits_unique_count: int = 0
+    prs_unique_count: int = 0
+    comments_unique_count: int = 0
+
+    # Backward-compatible aliases for existing callers/tests.
+    @property
+    def commit_count(self) -> int:
+        return self.commits_unique_count
+
+    @property
+    def pr_count(self) -> int:
+        return self.prs_unique_count
+
+    @property
+    def comment_count(self) -> int:
+        return self.comments_unique_count
 
     @property
     def last_activity_at(self) -> Optional[datetime]:

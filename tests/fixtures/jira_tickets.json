@@ -1,0 +1,20 @@
+{
+  "FIN-7811": {
+    "id": "FIN-7811",
+    "summary": "Implement discrepancy detection pipeline",
+    "status": "In Progress",
+    "assignee": "Aarnav Gopinath"
+  },
+  "FIN-6310": {
+    "id": "FIN-6310",
+    "summary": "Finalize standup digest format",
+    "status": "Done",
+    "assignee": "Product Owner"
+  },
+  "FIN-9999": {
+    "id": "FIN-9999",
+    "summary": "Backlog placeholder",
+    "status": "To Do",
+    "assignee": null
+  }
+}
