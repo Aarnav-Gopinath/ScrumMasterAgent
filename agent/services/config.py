@@ -33,6 +33,7 @@ class Config:
     completion_labels: list[str] = field(default_factory=list)
     slack_webhook_url: str = ""
     jira_base_url: str = ""
+    repo_cache_ttl_hours: int = 6
 
 
 def load_config(path: str = "config.yml") -> Config:
@@ -57,4 +58,5 @@ def load_config(path: str = "config.yml") -> Config:
         completion_labels=list(raw.get("completion_labels") or []),
         slack_webhook_url=raw.get("slack_webhook_url") or "",
         jira_base_url=raw.get("jira_base_url") or os.environ.get("JIRA_BASE_URL", ""),
+        repo_cache_ttl_hours=int(raw.get("repo_cache_ttl_hours", 6)),
     )

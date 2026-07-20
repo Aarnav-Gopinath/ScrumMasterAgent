@@ -16,5 +16,11 @@
     "summary": "Backlog placeholder",
     "status": "To Do",
     "assignee": null
+  },
+  "FIN-0042": {
+    "id": "FIN-0042",
+    "summary": "Wire up auth API backend endpoints",
+    "status": "In Progress",
+    "assignee": "bob"
   }
 }

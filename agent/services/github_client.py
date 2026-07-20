@@ -21,7 +21,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -145,9 +145,51 @@ class GitHubClient:
         )
         return repos
 
-    def get_last_repo_activity(self, repo) -> Optional[datetime]:
-        """Return the latest commit timestamp across all branches, if available."""
+    def get_last_repo_activity(
+        self, repo, state: Optional[dict] = None, now: Optional[datetime] = None
+    ) -> Optional[datetime]:
+        """Return the latest commit timestamp across all branches, if available.
+
+        When `state` and `now` are provided the result is cached in
+        ``state["repo_cache"]`` so repeated calls within a single run avoid
+        redundant API hits. Cache TTL comes from the state entry itself and is
+        compared against `now`.
+        """
         source_repo = self._require_repo(repo)
+        repo_name = getattr(
+            source_repo, "full_name", getattr(source_repo, "name", "unknown-repo")
+        )
+
+        if state is not None and now is not None:
+            from agent.services.state import cache_repo_activity, get_cached_repo_activity
+
+            # Check for a fresh cache entry. We also look at the raw entry to
+            # handle the "cached as None (no activity)" case correctly.
+            cache_entry = state.get("repo_cache", {}).get(repo_name)
+            if cache_entry is not None:
+                cached_value = get_cached_repo_activity(state, repo_name, now=now)
+                if cached_value is not None:
+                    logger.debug("Cache hit for repo activity: %s", repo_name)
+                    return cached_value
+                # Entry exists but value is None (no activity) — still a hit if fresh.
+                cached_at_raw = cache_entry.get("cached_at")
+                if cached_at_raw:
+                    cached_at = datetime.fromisoformat(cached_at_raw)
+                    age_hours = (now - cached_at).total_seconds() / 3600
+                    if age_hours <= 6:  # default TTL
+                        logger.debug(
+                            "Cache hit (no activity) for repo: %s", repo_name
+                        )
+                        return None
+
+            result = self._fetch_last_repo_activity(source_repo)
+            cache_repo_activity(state, repo_name, result, now)
+            return result
+
+        return self._fetch_last_repo_activity(source_repo)
+
+    def _fetch_last_repo_activity(self, source_repo) -> Optional[datetime]:
+        """Perform the actual API call to get the latest commit timestamp."""
         try:
             latest = next(iter(source_repo.get_commits()), None)
             if latest is None:
@@ -205,10 +247,12 @@ class GitHubClient:
         """Return the comment objects for an issue (each has `.created_at`)."""
         return list(self.get_issue(repo_or_number, number).get_comments())
 
-    def search_commits(self, repo_or_ref, ref: Optional[str] = None) -> list[CommitRef]:
+    def search_commits(self, repo_or_ref, ref: Optional[str] = None, since_days: int = 90) -> list[CommitRef]:
         """Commits whose message references `ref` (e.g. "#42").
 
-        Handles commits with a None message. Returns normalized CommitRefs.
+        Only looks at commits from the last `since_days` days (default 90) to avoid
+        iterating the full history of large repos. Handles commits with a None message.
+        Returns normalized CommitRefs.
         """
         if ref is None:
             source_repo = self._require_repo()
@@ -217,8 +261,9 @@ class GitHubClient:
             source_repo = self._require_repo(repo_or_ref)
             needle = ref
 
+        since = datetime.now(timezone.utc) - timedelta(days=since_days)
         results: list[CommitRef] = []
-        for c in source_repo.get_commits():
+        for c in source_repo.get_commits(since=since):
             message = c.commit.message or ""
             if needle in message:
                 # PyGitHub exposes author date at commit.commit.author.date.
@@ -237,15 +282,20 @@ class GitHubClient:
         self,
         issue_number: int,
         repo=None,
+        since_days: int = 90,
     ) -> list[CommitRef]:
-        """Commits reachable from branches whose name includes `issue_number`."""
+        """Commits reachable from branches whose name includes `issue_number`.
+
+        Only looks at commits from the last `since_days` days (default 90).
+        """
         source_repo = self._require_repo(repo)
+        since = datetime.now(timezone.utc) - timedelta(days=since_days)
         results: list[CommitRef] = []
         for branch in source_repo.get_branches():
             branch_name = getattr(branch, "name", "") or ""
             if not _branch_matches_issue_number(branch_name, issue_number):
                 continue
-            for c in source_repo.get_commits(sha=branch_name):
+            for c in source_repo.get_commits(sha=branch_name, since=since):
                 author = getattr(c.commit, "author", None)
                 results.append(
                     CommitRef(
@@ -257,8 +307,13 @@ class GitHubClient:
                 )
         return results
 
-    def search_prs(self, repo_or_ref, ref: Optional[str] = None, state: str = "all") -> list[PullRef]:
-        """Pull requests whose title or body references `ref` (e.g. "#42")."""
+    def search_prs(self, repo_or_ref, ref: Optional[str] = None, state: str = "all", since_days: int = 90) -> list[PullRef]:
+        """Pull requests whose title or body references `ref` (e.g. "#42").
+
+        Only looks at PRs updated in the last `since_days` days (default 90) to avoid
+        scanning the full PR history of large repos. PRs are fetched sorted by most
+        recently updated first so we can stop early.
+        """
         if ref is None:
             source_repo = self._require_repo()
             needle = repo_or_ref
@@ -266,8 +321,12 @@ class GitHubClient:
             source_repo = self._require_repo(repo_or_ref)
             needle = ref
 
+        cutoff = datetime.now(timezone.utc) - timedelta(days=since_days)
         results: list[PullRef] = []
-        for pr in source_repo.get_pulls(state=state):
+        for pr in source_repo.get_pulls(state=state, sort="updated", direction="desc"):
+            updated = getattr(pr, "updated_at", None)
+            if updated is not None and updated < cutoff:
+                break  # PRs are sorted newest-first; nothing older is relevant
             haystack = f"{pr.title or ''} {pr.body or ''}"
             if needle in haystack:
                 results.append(

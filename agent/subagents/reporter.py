@@ -11,7 +11,7 @@ from agent.models import ActivitySnapshot, Story, StoryStatus
 from agent.services.config import Config
 from agent.services.github_client import GitHubClient
 from agent.services.llm import generate_standup_summary
-from agent.services.metrics import build_activity_snapshot, infer_status, is_repo_abandoned
+from agent.services.metrics import build_activity_snapshot, detect_jira_discrepancies, infer_status, is_repo_abandoned
 from agent.services.notifier import Notifier
 from agent.services.teams_notifier import TeamsNotifier
 
@@ -20,6 +20,11 @@ logger = logging.getLogger(__name__)
 _ACTIVE_STATUSES = {
     StoryStatus.IN_PROGRESS,
     StoryStatus.IN_REVIEW,
+    StoryStatus.STALLED,
+}
+
+_DISCREPANCY_STATUSES = {
+    StoryStatus.IN_PROGRESS,
     StoryStatus.STALLED,
 }
 
@@ -36,6 +41,8 @@ def run(
     now: datetime,
     anthropic_client=None,
     notifier: Optional[Notifier] = None,
+    jira_client=None,
+    state: Optional[dict] = None,
 ) -> str:
     """Build and post the daily multi-repo standup digest."""
     _ = anthropic_client  # Anthropic client injection reserved for a later session.
@@ -53,9 +60,11 @@ def run(
     logger.info("Reporter scanning %d repo(s).", len(repos))
 
     repo_summaries: list[dict] = []
+    all_discrepancies: list[tuple[str, object]] = []  # (repo_name, JiraDiscrepancy)
+
     for repo in repos:
         repo_name = getattr(repo, "full_name", getattr(repo, "name", "unknown-repo"))
-        last_activity = client.get_last_repo_activity(repo)
+        last_activity = client.get_last_repo_activity(repo, state=state, now=now)
         if is_repo_abandoned(last_activity, now, config.abandoned_days):
             if last_activity is None:
                 logger.info(
@@ -80,6 +89,12 @@ def run(
             )
             if status in _ACTIVE_STATUSES:
                 stories.append((story, status, snapshot))
+            if jira_client is not None and status in _DISCREPANCY_STATUSES:
+                discrepancies = detect_jira_discrepancies(
+                    story, snapshot, status, jira_client, config.staleness_days, now
+                )
+                for d in discrepancies:
+                    all_discrepancies.append((repo_name, d))
 
         logger.info("%s active stories found in %s", len(stories), repo_name)
         if stories:
@@ -117,6 +132,20 @@ def run(
         per_repo_sections.append("\n".join(lines))
 
     body = f"{heading}\n\n" + "\n\n".join(per_repo_sections) + f"\n\n{digest}"
+
+    # Append Jira Discrepancies section when any mismatches were found.
+    if all_discrepancies:
+        from agent.models import describe_discrepancy
+        jira_lines = ["## Jira Discrepancies"]
+        repos_seen: dict[str, list] = {}
+        for repo_name_d, disc in all_discrepancies:
+            repos_seen.setdefault(repo_name_d, []).append(disc)
+        for repo_name_d, discs in repos_seen.items():
+            jira_lines.append(f"### {repo_name_d}")
+            for d in discs:
+                jira_lines.append(f"- {describe_discrepancy(d)} (#{d.issue_number})")
+        body = body + "\n\n" + "\n".join(jira_lines)
+
     notifier.post_comment(config.standup_issue_number, body, repo=target_repo)
     logger.info("Posted standup to issue #%s.", config.standup_issue_number)
 

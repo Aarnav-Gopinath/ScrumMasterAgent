@@ -10,8 +10,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from agent.models import ActivitySnapshot, Story, StoryStatus
+from agent.models import ActivitySnapshot, JiraDiscrepancy, Story, StoryStatus
 from agent.services.github_client import GitHubClient
+from agent.services.jira_client import extract_ticket_ids
 from agent.services.notifier import AGENT_COMMENT_MARKER
 
 
@@ -103,6 +104,7 @@ def build_activity_snapshot(
         commits_unique_count=len(commits_by_sha),
         prs_unique_count=len(prs_by_number),
         comments_unique_count=len(comments_by_id),
+        commit_messages=[c.message for c in commits_by_sha.values()],
     )
 
 
@@ -141,3 +143,76 @@ def infer_status(
         gap = (now - last).days
 
     return StoryStatus.IN_PROGRESS if gap <= staleness_days else StoryStatus.STALLED
+
+
+def detect_jira_discrepancies(
+    story: Story,
+    snapshot: ActivitySnapshot,
+    status: StoryStatus,
+    jira_client,
+    staleness_days: int,
+    now: datetime,
+) -> list[JiraDiscrepancy]:
+    """Check for Jira/GitHub state mismatches on a story. Pure function — no API calls.
+
+    Requires snapshot.commit_messages to be populated (see build_activity_snapshot).
+    Returns an empty list when there are no FIN references in the commit messages or
+    when all ticket states align with the GitHub story state.
+
+    `staleness_days` is accepted for interface consistency but is not used in the
+    current discrepancy rules.
+    """
+    ticket_ids = extract_ticket_ids(snapshot.commit_messages)
+    if not ticket_ids:
+        return []
+
+    discrepancies: list[JiraDiscrepancy] = []
+    for ticket_id in ticket_ids:
+        ticket = jira_client.get_ticket(ticket_id)
+
+        if ticket is None:
+            # Only flag missing tickets when the story has real commit activity.
+            if snapshot.commits_unique_count > 0:
+                discrepancies.append(
+                    JiraDiscrepancy(
+                        issue_number=story.number,
+                        ticket_id=ticket_id,
+                        ticket_status="",
+                        github_status=status.value,
+                        days_since_activity=0,
+                        discrepancy_type="no_jira_ticket_found",
+                    )
+                )
+            continue
+
+        ticket_status = ticket.get("status", "")
+
+        if ticket_status == "In Progress" and status is StoryStatus.STALLED:
+            days = (
+                business_days_between(snapshot.last_activity_at, now)
+                if snapshot.last_activity_at is not None
+                else 0
+            )
+            discrepancies.append(
+                JiraDiscrepancy(
+                    issue_number=story.number,
+                    ticket_id=ticket_id,
+                    ticket_status=ticket_status,
+                    github_status=status.value,
+                    days_since_activity=days,
+                    discrepancy_type="jira_in_progress_no_commits",
+                )
+            )
+        elif ticket_status == "Done" and story.state == "open":
+            discrepancies.append(
+                JiraDiscrepancy(
+                    issue_number=story.number,
+                    ticket_id=ticket_id,
+                    ticket_status=ticket_status,
+                    github_status=status.value,
+                    days_since_activity=0,
+                    discrepancy_type="jira_done_issue_open",
+                )
+            )
+
+    return discrepancies

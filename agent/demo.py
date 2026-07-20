@@ -10,10 +10,12 @@ completion.
 
 from __future__ import annotations
 
+import html as _html_module
 import json
 import logging
 import os
 import sys
+import webbrowser
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -31,6 +33,8 @@ from agent.subagents import completion, pr_watcher, reporter, staleness
 
 FIXTURE_PATH = "tests/fixtures"
 DEMO_STATE_PATH = ".demo-state.json"
+# Cap per-repo issue scan in demo/live mode to keep runtime manageable.
+_MAX_ISSUES_PER_REPO_DEMO = 30
 logger = logging.getLogger(__name__)
 
 
@@ -208,6 +212,16 @@ def _run_live_mode(mode: str, now: datetime) -> int:
             "(no ANTHROPIC_API_KEY). Add key for Claude output."
         )
 
+    # Build Jira client once — shared across repos for live modes.
+    jira_client = None
+    if mode in {"staleness", "standup"}:
+        try:
+            from agent.services.jira_client import JiraClient
+            jira_client = JiraClient.from_env()
+            print("Jira client: connected.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"Jira client unavailable — discrepancy detection disabled: {exc}")
+
     event_payload = {}
     event_path = os.environ.get("GITHUB_EVENT_PATH")
     if event_path and os.path.exists(event_path):
@@ -234,7 +248,14 @@ def _run_live_mode(mode: str, now: datetime) -> int:
                 continue
 
             summary: list[tuple[int, str]] = []
-            for issue in repo_client.get_open_issues(repo):
+            issues = repo_client.get_open_issues(repo)
+            if len(issues) > _MAX_ISSUES_PER_REPO_DEMO:
+                print(
+                    f"  (capping to first {_MAX_ISSUES_PER_REPO_DEMO} of "
+                    f"{len(issues)} open issues — demo mode)"
+                )
+                issues = issues[:_MAX_ISSUES_PER_REPO_DEMO]
+            for issue in issues:
                 story = Story.from_issue(issue)
                 snapshot = build_activity_snapshot(repo_client, story, repo=repo)
                 status = infer_status(
@@ -283,6 +304,20 @@ def _run_live_mode(mode: str, now: datetime) -> int:
                         f"DRY RUN outreach targets for #{story.number}: "
                         "(none found, fallback to assignee)"
                     )
+
+                # Jira discrepancy dry-run output for stalled stories.
+                if jira_client is not None:
+                    from agent.models import describe_discrepancy
+                    from agent.services.metrics import detect_jira_discrepancies
+                    discrepancies = detect_jira_discrepancies(
+                        story, snapshot, status, jira_client, config.staleness_days, now
+                    )
+                    for d in discrepancies:
+                        print(
+                            f"JIRA DISCREPANCY — would post to issue #{story.number} "
+                            f"in {repo_name}:\n"
+                            f"{describe_discrepancy(d)}"
+                        )
             print(f"summary: {summary}")
         elif mode == "standup":
             last_activity = org_client.get_last_repo_activity(repo)
@@ -296,7 +331,15 @@ def _run_live_mode(mode: str, now: datetime) -> int:
                 continue
 
             repo_active_stories: list[tuple[Story, StoryStatus, object]] = []
-            for issue in repo_client.get_open_issues(repo):
+            repo_discrepancies: list[tuple[str, object]] = []
+            issues = repo_client.get_open_issues(repo)
+            if len(issues) > _MAX_ISSUES_PER_REPO_DEMO:
+                print(
+                    f"  (capping to first {_MAX_ISSUES_PER_REPO_DEMO} of "
+                    f"{len(issues)} open issues — demo mode)"
+                )
+                issues = issues[:_MAX_ISSUES_PER_REPO_DEMO]
+            for issue in issues:
                 story = Story.from_issue(issue)
                 snapshot = build_activity_snapshot(repo_client, story, repo=repo)
                 status = infer_status(
@@ -304,10 +347,28 @@ def _run_live_mode(mode: str, now: datetime) -> int:
                 )
                 if status in {StoryStatus.IN_PROGRESS, StoryStatus.IN_REVIEW, StoryStatus.STALLED}:
                     repo_active_stories.append((story, status, snapshot))
+                if jira_client is not None and status in {StoryStatus.IN_PROGRESS, StoryStatus.STALLED}:
+                    from agent.models import describe_discrepancy
+                    from agent.services.metrics import detect_jira_discrepancies
+                    discs = detect_jira_discrepancies(
+                        story, snapshot, status, jira_client, config.staleness_days, now
+                    )
+                    for d in discs:
+                        repo_discrepancies.append((repo_name, d))
 
             print(f"=== {repo_name} ({len(repo_active_stories)} active stories) ===")
             for story, status, _snapshot in repo_active_stories:
                 print(f"  - #{story.number} {story.title} [{status.value}]")
+
+            if repo_discrepancies:
+                print(f"\nJira discrepancies in {repo_name}:")
+                for _rname, d in repo_discrepancies:
+                    from agent.models import describe_discrepancy
+                    print(
+                        f"  JIRA DISCREPANCY — would post to issue #{d.issue_number} "
+                        f"in {repo_name}:\n"
+                        f"  {describe_discrepancy(d)}"
+                    )
 
             teams_notifier = TeamsNotifier.for_repo(repo_name, config)
             if teams_notifier is None:
@@ -348,7 +409,6 @@ def _run_live_mode(mode: str, now: datetime) -> int:
 
 
 MODES = {
-    "issues": demo_issues,
     "status": demo_status,
     "staleness": demo_staleness,
     "standup": demo_standup,

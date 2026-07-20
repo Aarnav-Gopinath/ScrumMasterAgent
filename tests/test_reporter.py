@@ -6,12 +6,25 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 from agent.services.config import load_config
+from agent.services.jira_client import FakeJiraClient
 from agent.subagents import reporter
 from tests.conftest import NOW
 
 
 def _config():
     return load_config("config.yml")
+
+
+def _jira_in_progress_client():
+    """FakeJiraClient with FIN-0042 In Progress (matches fixture stalled issue #42)."""
+    return FakeJiraClient({
+        "FIN-0042": {
+            "id": "FIN-0042",
+            "summary": "Wire up auth API",
+            "status": "In Progress",
+            "assignee": "bob",
+        }
+    })
 
 
 def test_standup_posts_to_configured_issue_with_repo_sections(client, monkeypatch):
@@ -88,3 +101,48 @@ def test_reporter_skips_teams_notifier_when_teams_empty(client, monkeypatch):
     reporter.run(client, config, NOW)
 
     assert called["for_repo"] == 0
+
+
+def test_reporter_jira_discrepancy_section_appears_when_discrepancies_exist(
+    client, monkeypatch
+):
+    """When FIN-0042 is In Progress but issue #42 is STALLED, the digest includes
+    the '## Jira Discrepancies' section."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    config = _config()
+
+    body = reporter.run(client, config, NOW, jira_client=_jira_in_progress_client())
+
+    assert "## Jira Discrepancies" in body
+    assert "FIN-0042" in body
+
+
+def test_reporter_jira_discrepancy_section_absent_when_none_found(client, monkeypatch):
+    """When all Jira ticket states align (no rule fires), the section is omitted."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    config = _config()
+
+    # FIN-0042 is "To Do" — no discrepancy rule fires for this status.
+    jira = FakeJiraClient({
+        "FIN-0042": {
+            "id": "FIN-0042",
+            "summary": "Wire up auth API",
+            "status": "To Do",   # neither "In Progress" nor "Done" → no mismatch
+            "assignee": None,
+        }
+    })
+
+    body = reporter.run(client, config, NOW, jira_client=jira)
+
+    assert "## Jira Discrepancies" not in body
+
+
+def test_reporter_runs_cleanly_when_jira_client_none(client, monkeypatch):
+    """jira_client=None (default) must not raise and must omit the Jira section."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    config = _config()
+
+    body = reporter.run(client, config, NOW)  # no jira_client
+
+    assert "## Jira Discrepancies" not in body
+    assert "Daily Standup" in body

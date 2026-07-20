@@ -71,6 +71,8 @@ class ActivitySnapshot:
 
     Timestamps may be None when no activity of that kind exists. `last_activity_at`
     returns the most recent non-None timestamp, or None if there's been no activity.
+    `commit_messages` carries raw message strings so Jira ticket IDs can be extracted
+    without a second pass through the client.
     """
 
     last_commit_at: Optional[datetime] = None
@@ -79,6 +81,7 @@ class ActivitySnapshot:
     commits_unique_count: int = 0
     prs_unique_count: int = 0
     comments_unique_count: int = 0
+    commit_messages: list = field(default_factory=list)
 
     # Backward-compatible aliases for existing callers/tests.
     @property
@@ -101,3 +104,36 @@ class ActivitySnapshot:
             if t is not None
         ]
         return max(stamps) if stamps else None
+
+
+@dataclass
+class JiraDiscrepancy:
+    """A detected mismatch between a Jira ticket state and the GitHub story state."""
+
+    issue_number: int
+    ticket_id: str
+    ticket_status: str
+    github_status: str
+    days_since_activity: int
+    discrepancy_type: str
+    # discrepancy_type is one of:
+    #   "jira_in_progress_no_commits" — Jira says In Progress but GitHub story is stalled
+    #   "jira_done_issue_open"        — Jira ticket is Done but GitHub issue is still open
+    #   "no_jira_ticket_found"        — commit references a ticket that doesn't exist in Jira
+
+
+def describe_discrepancy(d: "JiraDiscrepancy") -> str:
+    """Return a human-readable one-line description of a Jira discrepancy."""
+    if d.discrepancy_type == "jira_in_progress_no_commits":
+        return (
+            f"{d.ticket_id} is In Progress in Jira but no GitHub commits "
+            f"in {d.days_since_activity} days"
+        )
+    if d.discrepancy_type == "jira_done_issue_open":
+        return (
+            f"{d.ticket_id} is Done in Jira but GitHub issue #{d.issue_number} "
+            f"is still open"
+        )
+    if d.discrepancy_type == "no_jira_ticket_found":
+        return f"No Jira ticket found for commits referencing {d.ticket_id}"
+    return f"Unknown discrepancy type: {d.discrepancy_type}"

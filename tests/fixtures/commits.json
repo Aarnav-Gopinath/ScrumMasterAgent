@@ -40,5 +40,11 @@
     "message": "#42 fix edge case",
     "date_days_ago": 6,
     "author_login": "dave"
+  },
+  {
+    "sha": "fin042abc",
+    "message": "#42 FIN-0042 add auth token validation",
+    "date_days_ago": 6,
+    "author_login": "alice"
   }
 ]

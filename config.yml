@@ -25,3 +25,4 @@ completion_labels:               # labels a story must have to count as properly
   - "status: done"
 slack_webhook_url: ""            # leave empty for POC
 jira_base_url: ""                # if blank, load from JIRA_BASE_URL env var
+repo_cache_ttl_hours: 6          # how long to cache repo last-activity results

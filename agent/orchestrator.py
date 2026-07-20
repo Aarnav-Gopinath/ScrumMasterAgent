@@ -10,7 +10,8 @@ from datetime import datetime, timezone
 
 from agent.services.config import load_config
 from agent.services.github_client import GitHubClient
-from agent.services.state import load_state
+from agent.services.jira_client import JiraClient
+from agent.services.state import load_state, save_state
 from agent.subagents import completion, pr_watcher, reporter, staleness
 
 STATE_PATH = "agent-state.json"
@@ -70,10 +71,28 @@ def main() -> None:
 
     try:
         if mode == "staleness":
+            jira_client = None
+            try:
+                jira_client = JiraClient.from_env()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Jira client unavailable — discrepancy detection disabled for this run: %s",
+                    exc,
+                )
             state = load_state(STATE_PATH)
-            staleness.run(client, config, state, now=now, state_path=STATE_PATH)
+            staleness.run(client, config, state, now=now, state_path=STATE_PATH, jira_client=jira_client)
         elif mode == "standup":
-            reporter.run(client, config, now=now)
+            jira_client = None
+            try:
+                jira_client = JiraClient.from_env()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Jira client unavailable — discrepancy detection disabled for this run: %s",
+                    exc,
+                )
+            state = load_state(STATE_PATH)
+            reporter.run(client, config, now=now, jira_client=jira_client, state=state)
+            save_state(STATE_PATH, state)
         elif mode == "pr_watcher":
             event_payload = _load_event_payload(logger)
             event_repo = event_payload.get("repository", {}).get("full_name")

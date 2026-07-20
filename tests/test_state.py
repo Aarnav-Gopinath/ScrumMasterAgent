@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from agent.services.state import (
+    cache_repo_activity,
+    get_cached_repo_activity,
     load_state,
     record_reminder,
     save_state,
@@ -57,3 +59,51 @@ def test_save_then_load_roundtrips(tmp_path):
     # Sanity: it's valid JSON with the expected shape.
     with open(path) as fh:
         assert json.load(fh)["1"]["reminder_count"] == 1
+
+
+# ── repo activity cache ───────────────────────────────────────────────────────
+
+
+_REPO = "UST-PACE/some-repo"
+_ACTIVITY = datetime(2026, 6, 28, 10, 0, 0, tzinfo=timezone.utc)
+
+
+def test_cache_miss_when_repo_not_in_state():
+    state: dict = {}
+    assert get_cached_repo_activity(state, _REPO) is None
+
+
+def test_cache_hit_when_fresh():
+    """Storing and immediately reading back should be a cache hit."""
+    state: dict = {}
+    now = datetime.now(timezone.utc)
+    cache_repo_activity(state, _REPO, _ACTIVITY, now)
+
+    result = get_cached_repo_activity(state, _REPO, cache_ttl_hours=6, now=now)
+    assert result == _ACTIVITY
+
+
+def test_cache_miss_when_cached_at_older_than_ttl():
+    """An entry cached 7 hours ago (TTL=6h) must not be returned."""
+    state: dict = {}
+    stale_time = datetime.now(timezone.utc) - timedelta(hours=7)
+    cache_repo_activity(state, _REPO, _ACTIVITY, stale_time)
+
+    result = get_cached_repo_activity(state, _REPO, cache_ttl_hours=6)
+    assert result is None
+
+
+def test_cache_repo_activity_stores_and_retrieves():
+    """cache_repo_activity writes; get_cached_repo_activity reads it back."""
+    state: dict = {}
+    now = datetime.now(timezone.utc)
+    cache_repo_activity(state, _REPO, _ACTIVITY, now)
+
+    # Raw structure is correct.
+    entry = state["repo_cache"][_REPO]
+    assert "last_activity" in entry
+    assert "cached_at" in entry
+    assert datetime.fromisoformat(entry["last_activity"]) == _ACTIVITY
+
+    # High-level retrieval also works.
+    assert get_cached_repo_activity(state, _REPO, now=now) == _ACTIVITY

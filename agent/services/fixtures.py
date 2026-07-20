@@ -196,7 +196,7 @@ class FixtureRepo:
     def get_issue(self, number: int) -> FixtureIssue:
         return self._issues[number]
 
-    def get_commits(self, sha: Optional[str] = None):
+    def get_commits(self, sha: Optional[str] = None, since=None, **kwargs):
         if sha is None:
             return list(self._commits)
         if sha in self._branch_commits:
@@ -206,7 +206,7 @@ class FixtureRepo:
     def get_branches(self):
         return list(self._branches)
 
-    def get_pulls(self, state: str = "all"):
+    def get_pulls(self, state: str = "all", **kwargs):
         if state == "all":
             return list(self._pulls)
         return [p for p in self._pulls if p.state == state]

@@ -15,8 +15,8 @@ from typing import Optional
 from agent.models import Story, StoryStatus
 from agent.services.config import Config
 from agent.services.github_client import GitHubClient
-from agent.services.metrics import build_activity_snapshot, infer_status, is_repo_abandoned
-from agent.services.notifier import Notifier
+from agent.services.metrics import build_activity_snapshot, detect_jira_discrepancies, infer_status, is_repo_abandoned
+from agent.services.notifier import AGENT_COMMENT_MARKER, Notifier
 from agent.services.state import record_reminder, save_state, should_remind
 
 logger = logging.getLogger(__name__)
@@ -29,6 +29,7 @@ def run(
     now: datetime,
     notifier: Optional[Notifier] = None,
     state_path: Optional[str] = None,
+    jira_client=None,
 ) -> list[tuple[int, str]]:
     """Remind on stale stories. Returns a list of (issue_number, action_taken)."""
     notifier = notifier or Notifier(client)
@@ -40,7 +41,7 @@ def run(
         repos = [client.repo] if client.repo is not None else []
 
     for repo in repos:
-        last_activity = client.get_last_repo_activity(repo)
+        last_activity = client.get_last_repo_activity(repo, state=state, now=now)
         repo_name = getattr(repo, "full_name", getattr(repo, "name", "unknown-repo"))
         if is_repo_abandoned(last_activity, now, config.abandoned_days):
             if last_activity is None:
@@ -87,6 +88,26 @@ def run(
             record_reminder(state, story.number, now, last_status=status.value)
             logger.info("Reminded on #%s", story.number)
             summary.append((story.number, action))
+
+            # Jira discrepancy check — runs only when a reminder is also due.
+            if jira_client is not None:
+                from agent.models import describe_discrepancy
+                discrepancies = detect_jira_discrepancies(
+                    story, snapshot, status, jira_client, config.staleness_days, now
+                )
+                if discrepancies:
+                    types = [d.discrepancy_type for d in discrepancies]
+                    logger.info("Jira discrepancy found for #%s: %s", story.number, types)
+                    lines = [
+                        f"- {describe_discrepancy(d)}" for d in discrepancies
+                    ]
+                    discrepancy_body = (
+                        "⚠️ **Jira Discrepancy Detected**\n\n"
+                        + "\n".join(lines)
+                    )
+                    notifier.post_comment(story.number, discrepancy_body, repo=repo)
+                else:
+                    logger.debug("No Jira discrepancies for #%s", story.number)
 
     if state_path is not None:
         save_state(state_path, state)

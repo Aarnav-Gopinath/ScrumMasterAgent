@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 
@@ -66,3 +66,60 @@ def record_reminder(
     if last_status is not None:
         entry["last_status"] = last_status
     state[key] = entry
+
+
+# ----- repo activity cache ---------------------------------------------------
+
+
+def get_cached_repo_activity(
+    state: dict,
+    repo_full_name: str,
+    cache_ttl_hours: int = 6,
+    now: Optional[datetime] = None,
+) -> Optional[datetime]:
+    """Return cached last_activity for `repo_full_name` if the entry is still fresh.
+
+    Returns None on cache miss (not found) or cache expiry (cached_at older than
+    `cache_ttl_hours`). The caller should then fetch from the API and call
+    `cache_repo_activity` to populate the cache.
+
+    `now` can be injected for deterministic tests; otherwise real wall-clock is used.
+    """
+    cache = state.get("repo_cache", {})
+    entry = cache.get(repo_full_name)
+    if entry is None:
+        return None
+
+    cached_at_raw = entry.get("cached_at")
+    if not cached_at_raw:
+        return None
+
+    cached_at = datetime.fromisoformat(cached_at_raw)
+    check_time = now if now is not None else datetime.now(cached_at.tzinfo or timezone.utc)
+    age_hours = (check_time - cached_at).total_seconds() / 3600
+    if age_hours > cache_ttl_hours:
+        return None
+
+    last_activity_raw = entry.get("last_activity")
+    if last_activity_raw is None:
+        # Cached value is "no activity" — this is a valid hit, but callers can't
+        # distinguish it from a miss via the return value. The presence of the
+        # entry in the cache indicates a hit; callers that need this distinction
+        # should inspect state["repo_cache"] directly.
+        return None
+    return datetime.fromisoformat(last_activity_raw)
+
+
+def cache_repo_activity(
+    state: dict,
+    repo_full_name: str,
+    last_activity: Optional[datetime],
+    now: datetime,
+) -> None:
+    """Store `last_activity` for `repo_full_name` in the state cache (mutates `state`)."""
+    if "repo_cache" not in state:
+        state["repo_cache"] = {}
+    state["repo_cache"][repo_full_name] = {
+        "last_activity": last_activity.isoformat() if last_activity is not None else None,
+        "cached_at": now.isoformat(),
+    }

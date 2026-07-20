@@ -115,7 +115,10 @@ def test_snapshot_links_commits_by_reference(client):
     story = Story.from_issue(client.get_issue(42))
     snapshot = build_activity_snapshot(client, story)
     # One SHA is discovered from both message and branch scans and must be deduplicated.
-    assert snapshot.commits_unique_count == 3
+    # Commits: c3d4e5f (#42 add form validation), e5f6g7h (#42 fix edge case),
+    #          d4e5f6g (branch-only: refine validation checks),
+    #          fin042abc (#42 FIN-0042 add auth token validation) — added in session 4.
+    assert snapshot.commits_unique_count == 4
     assert snapshot.prs_unique_count == 0
     assert snapshot.last_activity_at is not None
 
