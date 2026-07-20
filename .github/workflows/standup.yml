@@ -1,31 +1,28 @@
 name: Standup Reporter
 
-# Daily at 09:15 UTC, weekdays. Posts the natural-language standup digest.
 on:
   schedule:
     - cron: "15 9 * * 1-5"
-  workflow_dispatch: {}
-
-permissions:
-  issues: write
+  workflow_dispatch:
 
 jobs:
-  standup:
-    if: github.repository_owner == 'UST-PACE'
+  run:
     runs-on: ubuntu-latest
+    if: github.repository_owner == 'UST-PACE'
+    permissions:
+      issues: write
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Post standup digest
+      - run: pip install -r requirements.txt
+      - run: python -m agent.orchestrator
         env:
           AGENT_MODE: standup
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: python -m agent.orchestrator
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}

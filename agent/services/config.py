@@ -24,10 +24,12 @@ class Config:
 
     org_name: str
     agent_repo: str
-    standup_issue_number: int
+    standup_issue_number: int = 1
     staleness_days: int = 2
     abandoned_days: int = 30
     business_days_only: bool = True
+    teams: list[dict] = field(default_factory=list)
+    teams_fallback_webhook: str = ""
     completion_labels: list[str] = field(default_factory=list)
     slack_webhook_url: str = ""
     jira_base_url: str = ""
@@ -46,10 +48,12 @@ def load_config(path: str = "config.yml") -> Config:
     return Config(
         org_name=raw["org_name"],
         agent_repo=raw["agent_repo"],
-        standup_issue_number=int(raw["standup_issue_number"]),
+        standup_issue_number=int(raw.get("standup_issue_number", 1)),
         staleness_days=int(raw.get("staleness_days", 2)),
         abandoned_days=int(raw.get("abandoned_days", 30)),
         business_days_only=bool(raw.get("business_days_only", True)),
+        teams=list(raw.get("teams") or []),
+        teams_fallback_webhook=raw.get("teams_fallback_webhook") or "",
         completion_labels=list(raw.get("completion_labels") or []),
         slack_webhook_url=raw.get("slack_webhook_url") or "",
         jira_base_url=raw.get("jira_base_url") or os.environ.get("JIRA_BASE_URL", ""),
