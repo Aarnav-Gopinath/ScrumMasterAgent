@@ -1,0 +1,13 @@
+{
+  "42": {
+    "last_reminder_sent_at": "2026-07-20T03:56:56.696281+00:00",
+    "last_status": "stalled",
+    "reminder_count": 1
+  },
+  "repo_cache": {
+    "unknown-repo": {
+      "cached_at": "2026-07-20T03:56:56.696281+00:00",
+      "last_activity": "2026-07-20T03:56:56.696281+00:00"
+    }
+  }
+}
