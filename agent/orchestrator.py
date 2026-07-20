@@ -1,12 +1,4 @@
-"""Entry point: routes a run to the right sub-agent based on AGENT_MODE.
-
-GitHub Actions invokes this with `AGENT_MODE` set (staleness | standup | pr_watcher |
-completion). Cron modes (staleness, standup) run on a schedule; event modes
-(pr_watcher, completion) read the triggering event from the JSON file GitHub Actions
-writes to GITHUB_EVENT_PATH.
-
-Run locally with, e.g.:  AGENT_MODE=staleness python -m agent.orchestrator
-"""
+"""Entry point: routes a run to the right sub-agent based on AGENT_MODE."""
 
 from __future__ import annotations
 
@@ -21,63 +13,93 @@ from agent.services.github_client import GitHubClient
 from agent.services.state import load_state
 from agent.subagents import completion, pr_watcher, reporter, staleness
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-)
-logger = logging.getLogger("orchestrator")
-
 STATE_PATH = "agent-state.json"
+VALID_MODES = {"staleness", "standup", "pr_watcher", "completion"}
 
 
-def load_event() -> dict:
-    """Read and parse the event payload GitHub Actions drops at GITHUB_EVENT_PATH.
+def _configure_logging() -> logging.Logger:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stdout,
+    )
+    return logging.getLogger("orchestrator")
 
-    Returns an empty dict if the var is unset or the file is missing (e.g. local runs),
-    so the event sub-agents degrade to "nothing to do" rather than crashing.
-    """
+
+def _load_event_payload(logger: logging.Logger) -> dict:
     path = os.environ.get("GITHUB_EVENT_PATH")
-    if not path or not os.path.exists(path):
-        logger.warning("GITHUB_EVENT_PATH not available — using empty event payload.")
-        return {}
-    with open(path, "r", encoding="utf-8") as fh:
-        return json.load(fh)
+    if not path:
+        logger.error("GITHUB_EVENT_PATH is required for event-driven modes.")
+        raise SystemExit(1)
+    if not os.path.exists(path):
+        logger.error("GITHUB_EVENT_PATH does not exist: %s", path)
+        raise SystemExit(1)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except json.JSONDecodeError:
+        logger.error("GITHUB_EVENT_PATH contains invalid JSON: %s", path)
+        raise SystemExit(1)
 
 
-def main() -> int:
+def main() -> None:
+    logger = _configure_logging()
+
     mode = os.environ.get("AGENT_MODE")
-    if len(sys.argv) > 1:
-        mode = sys.argv[1]  # allow `python -m agent.orchestrator staleness` too
+    if mode is None:
+        logger.error("AGENT_MODE is required. Valid values: %s", sorted(VALID_MODES))
+        raise SystemExit(1)
+    if mode not in VALID_MODES:
+        logger.error("Unrecognized AGENT_MODE %r. Valid values: %s", mode, sorted(VALID_MODES))
+        raise SystemExit(1)
 
-    valid = {"staleness", "standup", "pr_watcher", "completion"}
-    if mode not in valid:
-        logger.error("AGENT_MODE must be one of %s (got %r).", sorted(valid), mode)
-        return 2
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        logger.error("GITHUB_TOKEN is required.")
+        raise SystemExit(1)
 
-    config = load_config()
-    client = GitHubClient.from_token(config.repo_name)
+    config = load_config("config.yml")
+    client = GitHubClient.from_org_token(token, config.org_name)
     now = datetime.now(timezone.utc)
-    logger.info("Running mode=%s against %s", mode, config.repo_name)
+    logger.info(
+        "Starting %s run for %s at %s",
+        mode,
+        config.org_name,
+        now.isoformat(),
+    )
 
-    if mode == "staleness":
-        state = load_state(STATE_PATH)
-        summary = staleness.run(client, config, state, now, state_path=STATE_PATH)
-        logger.info("Staleness summary: %s", summary)
+    try:
+        if mode == "staleness":
+            state = load_state(STATE_PATH)
+            staleness.run(client, config, state, now=now, state_path=STATE_PATH)
+        elif mode == "standup":
+            reporter.run(client, config, now=now)
+        elif mode == "pr_watcher":
+            event_payload = _load_event_payload(logger)
+            event_repo = event_payload.get("repository", {}).get("full_name")
+            if event_repo:
+                event_client = GitHubClient.from_token(event_repo, token=token)
+            else:
+                logger.error("Event payload missing repository.full_name for pr_watcher mode.")
+                raise SystemExit(1)
+            pr_watcher.run(event_client, config, event_payload)
+        elif mode == "completion":
+            event_payload = _load_event_payload(logger)
+            event_repo = event_payload.get("repository", {}).get("full_name")
+            if event_repo:
+                event_client = GitHubClient.from_token(event_repo, token=token)
+            else:
+                logger.error("Event payload missing repository.full_name for completion mode.")
+                raise SystemExit(1)
+            completion.run(event_client, config, event_payload)
+    except SystemExit:
+        raise
+    except Exception:
+        logger.exception("Run failed with an unhandled exception.")
+        raise SystemExit(1)
 
-    elif mode == "standup":
-        reporter.run(client, config, now)
-
-    elif mode == "pr_watcher":
-        event = load_event()
-        summary = pr_watcher.run(client, config, event)
-        logger.info("PR watcher summary: %s", summary)
-
-    elif mode == "completion":
-        event = load_event()
-        result = completion.run(client, config, event)
-        logger.info("Completion result: %s", result)
-
-    return 0
+    logger.info("%s run completed successfully", mode)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

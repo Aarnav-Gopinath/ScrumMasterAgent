@@ -22,9 +22,11 @@ from agent.models import Story, StoryStatus
 from agent.services.config import load_config
 from agent.services.fixtures import FixtureRepo
 from agent.services.github_client import GitHubClient
+from agent.services.llm import generate_standup_summary
 from agent.services.metrics import build_activity_snapshot, infer_status, is_repo_abandoned
 from agent.services.notifier import AGENT_COMMENT_MARKER, Notifier
 from agent.services.state import load_state
+from agent.services.teams_notifier import TeamsNotifier
 from agent.subagents import completion, pr_watcher, reporter, staleness
 
 FIXTURE_PATH = "tests/fixtures"
@@ -124,7 +126,7 @@ def demo_standup(now: datetime) -> None:
     deterministic fallback digest — so this works fully offline."""
     config = load_config()
     client = _client(now)
-    body = reporter.run(client, config, now, jira_client=None)
+    body = reporter.run(client, config, now)
     print("Standup digest that would be posted to "
           f"issue #{config.standup_issue_number}:\n")
     print(body)
@@ -183,16 +185,16 @@ def _run_live_mode(mode: str, now: datetime) -> int:
     config = load_config()
     token = os.environ.get("GITHUB_TOKEN")
     org_client = GitHubClient.from_org_token(token=token, org_name=config.org_name)
-    repo_cap = 20 if mode == "staleness" else None
+    repo_cap = 75 if mode in {"staleness", "standup"} else None
     repos = org_client.get_org_repos(exclude_repo=config.agent_repo, max_repos=repo_cap)
 
     if not repos:
         print("No repos found after exclusions.")
         return 1
 
-    if mode == "staleness":
+    if mode in {"staleness", "standup"}:
         print(
-            "DEMO MODE: scanning first 20 repos only.\n"
+            "DEMO MODE: scanning first 75 repos by recent activity.\n"
             "Remove max_repos cap for full org scan."
         )
 
@@ -200,12 +202,20 @@ def _run_live_mode(mode: str, now: datetime) -> int:
         f"Live dry-run mode for {len(repos)} repo(s) in org {config.org_name} "
         f"(excluding {config.agent_repo})."
     )
+    if mode == "standup" and not os.environ.get("ANTHROPIC_API_KEY"):
+        print(
+            "DEMO MODE: using fallback digest\n"
+            "(no ANTHROPIC_API_KEY). Add key for Claude output."
+        )
 
     event_payload = {}
     event_path = os.environ.get("GITHUB_EVENT_PATH")
     if event_path and os.path.exists(event_path):
         with open(event_path, "r", encoding="utf-8") as fh:
             event_payload = json.load(fh)
+
+    all_active_stories: list[tuple[Story, StoryStatus, object]] = []
+    standup_repo_sections: list[tuple[str, list[tuple[Story, StoryStatus, object]]]] = []
 
     for repo in repos:
         repo_name = getattr(repo, "full_name", getattr(repo, "name", "unknown-repo"))
@@ -240,6 +250,17 @@ def _run_live_mode(mode: str, now: datetime) -> int:
                         repo, story, committers, config.staleness_days
                     )
                     summary.append((story.number, "dry-run:committers"))
+                    teams_notifier = TeamsNotifier.for_repo(repo_name, config)
+                    if teams_notifier is None:
+                        print(
+                            f"Teams routing: {repo_name} → "
+                            "no channel configured (add webhook to config.yml)"
+                        )
+                    else:
+                        print(
+                            f"Teams routing: {repo_name} → "
+                            "channel configured"
+                        )
                     print(
                         f"DRY RUN outreach targets for #{story.number}: "
                         f"{', '.join(committers)}"
@@ -247,19 +268,56 @@ def _run_live_mode(mode: str, now: datetime) -> int:
                 else:
                     notifier.remind_assignee(story, config.staleness_days, repo=repo)
                     summary.append((story.number, "dry-run:assignee"))
+                    teams_notifier = TeamsNotifier.for_repo(repo_name, config)
+                    if teams_notifier is None:
+                        print(
+                            f"Teams routing: {repo_name} → "
+                            "no channel configured (add webhook to config.yml)"
+                        )
+                    else:
+                        print(
+                            f"Teams routing: {repo_name} → "
+                            "channel configured"
+                        )
                     print(
                         f"DRY RUN outreach targets for #{story.number}: "
                         "(none found, fallback to assignee)"
                     )
             print(f"summary: {summary}")
         elif mode == "standup":
-            body = reporter.run(
-                repo_client,
-                config,
-                now=now,
-                notifier=notifier,
-            )
-            print(body)
+            last_activity = org_client.get_last_repo_activity(repo)
+            if is_repo_abandoned(last_activity, now, config.abandoned_days):
+                if last_activity is None:
+                    print(
+                        f"Skipping {repo_name} — no activity in over {config.abandoned_days} days"
+                    )
+                else:
+                    print(f"Skipping {repo_name} — no activity in {(now - last_activity).days} days")
+                continue
+
+            repo_active_stories: list[tuple[Story, StoryStatus, object]] = []
+            for issue in repo_client.get_open_issues(repo):
+                story = Story.from_issue(issue)
+                snapshot = build_activity_snapshot(repo_client, story, repo=repo)
+                status = infer_status(
+                    story, snapshot, config.staleness_days, config.business_days_only, now
+                )
+                if status in {StoryStatus.IN_PROGRESS, StoryStatus.IN_REVIEW, StoryStatus.STALLED}:
+                    repo_active_stories.append((story, status, snapshot))
+
+            print(f"=== {repo_name} ({len(repo_active_stories)} active stories) ===")
+            for story, status, _snapshot in repo_active_stories:
+                print(f"  - #{story.number} {story.title} [{status.value}]")
+
+            teams_notifier = TeamsNotifier.for_repo(repo_name, config)
+            if teams_notifier is None:
+                print(f"Teams routing: {repo_name} → no channel configured (teams list empty)")
+            else:
+                print(f"Teams routing: {repo_name} → channel configured")
+
+            if repo_active_stories:
+                all_active_stories.extend(repo_active_stories)
+                standup_repo_sections.append((repo_name, repo_active_stories))
         elif mode == "pr_watcher":
             if event_payload:
                 summary = pr_watcher.run(repo_client, config, event_payload, notifier=notifier)
@@ -272,6 +330,20 @@ def _run_live_mode(mode: str, now: datetime) -> int:
         else:
             logger.warning("Unknown live mode %s", mode)
             return 2
+
+    if mode == "standup":
+        heading = f"## Daily Standup — {now.date().isoformat()}"
+        if not all_active_stories:
+            print(f"\n{heading}\n\nNo active work detected across UST-PACE repos.")
+            return 0
+
+        digest = generate_standup_summary(all_active_stories)
+        print(f"\n{heading}")
+        for repo_name, repo_stories in standup_repo_sections:
+            print(f"\n### {repo_name} ({len(repo_stories)} active stories)")
+            for story, status, _snapshot in repo_stories:
+                print(f"- #{story.number} {story.title} — {status.value}")
+        print(f"\n{digest}")
     return 0
 
 

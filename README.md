@@ -143,3 +143,29 @@ nudge would make a stalled story look active and it would stop following up.
 - **Rate limits / cost**: activity detection issues several reads per story. For a large
   repo, cache the commit/PR scans or use a GraphQL batch query — see the notes in
   `github_client.py` and `metrics.py`.
+
+## Production Deployment Checklist
+
+[ ] Transfer repo to UST-PACE via
+    GitHub Settings → Danger Zone → Transfer repository  
+[ ] Create a GitHub issue titled "Daily Standup" in the
+    new UST-PACE agent repo and update
+    standup_issue_number in config.yml  
+[ ] Populate teams: section in config.yml with team
+    names, webhook URLs, and repo lists once Teams
+    channels and mapping are confirmed  
+[ ] Set these secrets in the UST-PACE repo or org:  
+      ANTHROPIC_API_KEY  
+      JIRA_BASE_URL  
+      JIRA_EMAIL  
+      JIRA_API_TOKEN  
+      TEAMS_WEBHOOK_URL (if using single channel)  
+    (GITHUB_TOKEN is provided automatically by Actions)  
+[ ] Enable GitHub Actions in the transferred repo  
+[ ] Run each workflow manually via workflow_dispatch
+    to verify end-to-end before relying on the schedule  
+[ ] Confirm agent-state.json is committed back after
+    each staleness run  
+[ ] Run python -m agent.scripts.build_teams_mapping
+    to auto-populate teams_users.yml with org member
+    emails

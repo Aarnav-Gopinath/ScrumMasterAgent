@@ -33,51 +33,60 @@ def run(
     """Remind on stale stories. Returns a list of (issue_number, action_taken)."""
     notifier = notifier or Notifier(client)
     summary: list[tuple[int, str]] = []
-    repo = client.repo
 
-    last_activity = client.get_last_repo_activity(repo)
-    if is_repo_abandoned(last_activity, now, config.abandoned_days):
+    try:
+        repos = client.get_org_repos(exclude_repo=config.agent_repo)
+    except ValueError:
+        repos = [client.repo] if client.repo is not None else []
+
+    for repo in repos:
+        last_activity = client.get_last_repo_activity(repo)
         repo_name = getattr(repo, "full_name", getattr(repo, "name", "unknown-repo"))
-        if last_activity is None:
-            logger.info("Skipping %s — no activity in over %d days", repo_name, config.abandoned_days)
-        else:
-            days_inactive = (now - last_activity).days
-            logger.info("Skipping %s — no activity in %d days", repo_name, days_inactive)
-        return summary
-
-    for issue in client.get_open_issues(repo):
-        story = Story.from_issue(issue)
-        snapshot = build_activity_snapshot(client, story, repo=repo)
-        status = infer_status(
-            story, snapshot, config.staleness_days, config.business_days_only, now
-        )
-
-        if status is not StoryStatus.STALLED:
-            logger.info("#%s is %s — no reminder needed", story.number, status.value)
-            summary.append((story.number, f"skip:{status.value}"))
+        if is_repo_abandoned(last_activity, now, config.abandoned_days):
+            if last_activity is None:
+                logger.info(
+                    "Skipping %s — no activity in over %d days",
+                    repo_name,
+                    config.abandoned_days,
+                )
+            else:
+                days_inactive = (now - last_activity).days
+                logger.info("Skipping %s — no activity in %d days", repo_name, days_inactive)
             continue
 
-        if not should_remind(state, story.number, config.staleness_days, now):
-            logger.info("#%s stalled but reminded recently — skipping", story.number)
-            summary.append((story.number, "skip:already-reminded"))
-            continue
-
-        committers = client.get_branch_committers(repo, story.number)
-        if committers:
-            logger.info("Reminding branch committers for issue #%s: %s", story.number, committers)
-            notifier.ask_committers_for_status(repo, story, committers, config.staleness_days)
-            action = "reminded:committers"
-        else:
-            logger.info(
-                "No branch committers found for issue #%s — falling back to assignee",
-                story.number,
+        for issue in client.get_open_issues(repo):
+            story = Story.from_issue(issue)
+            snapshot = build_activity_snapshot(client, story, repo=repo)
+            status = infer_status(
+                story, snapshot, config.staleness_days, config.business_days_only, now
             )
-            notifier.remind_assignee(story, config.staleness_days, repo=repo)
-            action = "reminded:assignee"
 
-        record_reminder(state, story.number, now, last_status=status.value)
-        logger.info("Reminded on #%s", story.number)
-        summary.append((story.number, action))
+            if status is not StoryStatus.STALLED:
+                logger.info("#%s is %s — no reminder needed", story.number, status.value)
+                summary.append((story.number, f"skip:{status.value}"))
+                continue
+
+            if not should_remind(state, story.number, config.staleness_days, now):
+                logger.info("#%s stalled but reminded recently — skipping", story.number)
+                summary.append((story.number, "skip:already-reminded"))
+                continue
+
+            committers = client.get_branch_committers(repo, story.number)
+            if committers:
+                logger.info("Reminding branch committers for issue #%s: %s", story.number, committers)
+                notifier.ask_committers_for_status(repo, story, committers, config.staleness_days)
+                action = "reminded:committers"
+            else:
+                logger.info(
+                    "No branch committers found for issue #%s — falling back to assignee",
+                    story.number,
+                )
+                notifier.remind_assignee(story, config.staleness_days, repo=repo)
+                action = "reminded:assignee"
+
+            record_reminder(state, story.number, now, last_status=status.value)
+            logger.info("Reminded on #%s", story.number)
+            summary.append((story.number, action))
 
     if state_path is not None:
         save_state(state_path, state)

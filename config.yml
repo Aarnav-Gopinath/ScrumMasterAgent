@@ -3,7 +3,24 @@ agent_repo: "UST-PACE/scrum-master-agent"
 staleness_days: 2
 abandoned_days: 14
 business_days_only: true
-standup_issue_number: 1          # create one issue titled "Daily Standup" first
+# Teams channel-per-team configuration
+# Populated once webhook URLs and team-repo mapping
+# are confirmed by manager.
+# Format:
+#   teams:
+#     - name: "TeamName"
+#       webhook_url: "https://outlook.office.com/webhook/..."
+#       repos:
+#         - "UST-PACE/repo-name-1"
+#         - "UST-PACE/repo-name-2"
+teams: []
+
+# Fallback webhook for repos not assigned to any team.
+# Leave empty to skip unassigned repos.
+teams_fallback_webhook: ""
+
+standup_issue_number: 1          # TODO: update to real issue number
+                                 # in UST-PACE agent repo after transfer
 completion_labels:               # labels a story must have to count as properly done
   - "status: done"
 slack_webhook_url: ""            # leave empty for POC
