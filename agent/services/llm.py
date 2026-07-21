@@ -1,12 +1,15 @@
-"""Claude integration — the only place the agent spends LLM tokens.
+"""LLM integration — the only place the agent spends LLM tokens.
 
 `generate_standup_summary` turns structured story data into a natural-language standup
 report. By design this is the *sole* LLM call in the whole agent (the staleness / PR /
 completion sub-agents are pure logic), which keeps token cost predictable.
 
-The API key is read from ANTHROPIC_API_KEY at call time, never hardcoded. If the SDK
-is missing, the key is unset, or the API errors, we fall back to a plain-text summary
-built from the raw data so the standup still posts something useful.
+Supports two backends:
+- Anthropic Claude (ANTHROPIC_API_KEY)
+- GitHub Models (GITHUB_MODELS_TOKEN via OpenAI SDK)
+
+If neither key is set, the SDK is missing, or the API errors, we fall back to a 
+plain-text summary built from the raw data so the standup still posts something useful.
 """
 
 from __future__ import annotations
@@ -20,8 +23,13 @@ from agent.models import ActivitySnapshot, Story, StoryStatus
 
 logger = logging.getLogger(__name__)
 
-MODEL = "claude-sonnet-4-6"
+# Anthropic Claude config
+CLAUDE_MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 1024
+
+# GitHub Models config
+GITHUB_MODELS_ENDPOINT_DEFAULT = "https://models.inference.ai.azure.com"
+GITHUB_MODELS_MODEL_DEFAULT = "gpt-4o-mini"
 
 SYSTEM_PROMPT = (
     "You are a concise, upbeat scrum master summarizing a software sprint's daily "
@@ -101,44 +109,77 @@ def generate_standup_summary(
 ) -> str:
     """Return a natural-language standup report as a Markdown string.
 
-    Sends the story data to Claude; on any failure (missing SDK, missing key, API
+    Tries Anthropic Claude first (if ANTHROPIC_API_KEY is set), then GitHub Models
+    (if GITHUB_MODELS_TOKEN is set). On any failure (missing SDK, missing key, API
     error) returns `_fallback_summary` instead of raising, so the caller can always
     post *something*.
     """
     payload = _story_payload(stories_with_status)
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        logger.warning("ANTHROPIC_API_KEY not set — using fallback summary.")
-        return _fallback_summary(payload)
+    # Try Anthropic Claude first
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+    if anthropic_key:
+        try:
+            from anthropic import Anthropic
 
-    try:
-        # Imported lazily so the rest of the agent (and the offline demo/tests) never
-        # need the anthropic SDK installed just to import this module.
-        from anthropic import Anthropic
+            client = Anthropic(api_key=anthropic_key)
+            message = client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=MAX_TOKENS,
+                system=SYSTEM_PROMPT,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            "Here is today's sprint story data as JSON. Write the standup "
+                            "report.\n\n```json\n"
+                            + json.dumps(payload, indent=2)
+                            + "\n```"
+                        ),
+                    }
+                ],
+            )
+            text = "".join(
+                block.text for block in message.content if getattr(block, "type", None) == "text"
+            ).strip()
+            if text:
+                return text
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Claude call failed (%s) — trying fallback.", exc)
 
-        client = Anthropic(api_key=api_key)
-        message = client.messages.create(
-            model=MODEL,
-            max_tokens=MAX_TOKENS,
-            system=SYSTEM_PROMPT,
-            messages=[
-                {
-                    "role": "user",
-                    "content": (
-                        "Here is today's sprint story data as JSON. Write the standup "
-                        "report.\n\n```json\n"
-                        + json.dumps(payload, indent=2)
-                        + "\n```"
-                    ),
-                }
-            ],
-        )
-        # Concatenate any text blocks in the response.
-        text = "".join(
-            block.text for block in message.content if getattr(block, "type", None) == "text"
-        ).strip()
-        return text or _fallback_summary(payload)
-    except Exception as exc:  # noqa: BLE001 — any SDK/API failure falls back gracefully.
-        logger.exception("Claude call failed (%s) — using fallback summary.", exc)
-        return _fallback_summary(payload)
+    # Try GitHub Models
+    github_token = os.environ.get("GITHUB_MODELS_TOKEN")
+    if github_token:
+        try:
+            from openai import OpenAI
+
+            base_url = os.getenv("GITHUB_MODELS_ENDPOINT", GITHUB_MODELS_ENDPOINT_DEFAULT)
+            model = os.getenv("GITHUB_MODELS_MODEL", GITHUB_MODELS_MODEL_DEFAULT)
+            
+            client = OpenAI(base_url=base_url, api_key=github_token)
+            completion = client.chat.completions.create(
+                model=model,
+                max_tokens=MAX_TOKENS,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Here is today's sprint story data as JSON. Write the standup "
+                            "report.\n\n```json\n"
+                            + json.dumps(payload, indent=2)
+                            + "\n```"
+                        ),
+                    },
+                ],
+            )
+            text = completion.choices[0].message.content.strip() if completion.choices else ""
+            if text:
+                return text
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("GitHub Models call failed (%s) — using fallback.", exc)
+
+    # Fallback: neither key set or both failed
+    if not anthropic_key and not github_token:
+        logger.warning("Neither ANTHROPIC_API_KEY nor GITHUB_MODELS_TOKEN set — using fallback summary.")
+    return _fallback_summary(payload)

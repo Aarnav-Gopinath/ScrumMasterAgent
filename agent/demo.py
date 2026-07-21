@@ -409,29 +409,44 @@ def _run_live_mode(mode: str, now: datetime) -> int:
 
 
 def _build_report_html(
-    timestamp: str,
+    timestamp_str: str,
+    scan_duration: float,
     repos_scanned: int,
     active_repos: int,
     stalled_count: int,
     jira_discrepancy_count: int,
+    repos_skipped: int,
+    repos_no_issues: int,
+    total_issues_scanned: int,
     repo_data: list[dict],
     jira_discrepancies: list[dict],
     standup_digest: str,
+    now: datetime,
 ) -> str:
     """Build HTML report with inline CSS for the live report mode."""
     html_escape = _html_module.escape
     
-    # Build repo rows
+    # Build repo rows with improvements
     repo_rows = []
     for repo_info in repo_data:
         repo_name = repo_info["repo_name"]
         for issue_info in repo_info["issues"]:
             issue_num = issue_info["number"]
-            title = html_escape(issue_info["title"])
+            # Truncate title at 60 chars
+            title_full = issue_info["title"]
+            title = html_escape(title_full[:60] + "..." if len(title_full) > 60 else title_full)
             assignee = html_escape(issue_info["assignee"])
             status = issue_info["status"]
-            last_activity = html_escape(issue_info["last_activity"])
-            action = html_escape(issue_info["action"])
+            last_activity_str = issue_info["last_activity"]
+            last_activity_dt = issue_info.get("last_activity_dt")
+            action = issue_info["action"]
+            
+            # Calculate days ago
+            if last_activity_dt:
+                days_ago = (now - last_activity_dt).days
+                last_activity_display = f'{last_activity_str} ({days_ago} days ago)'
+            else:
+                last_activity_display = last_activity_str
             
             # Status badge color
             status_color = {
@@ -442,15 +457,24 @@ def _build_report_html(
                 "done": "#28a745",
             }.get(status, "#6c757d")
             
+            # Action color
+            action_color = "#6c757d"
+            if "Needs attention" in action:
+                action_color = "#EF4444"
+            elif "Active" in action:
+                action_color = "#10B981"
+            elif "review" in action.lower():
+                action_color = "#3B82F6"
+            
             repo_rows.append(
                 f'<tr>'
                 f'<td>{html_escape(repo_name)}</td>'
-                f'<td>#{issue_num}</td>'
+                f'<td><strong>#{issue_num}</strong></td>'
                 f'<td>{title}</td>'
                 f'<td>{assignee}</td>'
                 f'<td><span class="badge" style="background-color: {status_color};">{html_escape(status)}</span></td>'
-                f'<td>{last_activity}</td>'
-                f'<td>{action}</td>'
+                f'<td>{html_escape(last_activity_display)}</td>'
+                f'<td style="color: {action_color}; font-weight: 500;">{html_escape(action)}</td>'
                 f'</tr>'
             )
     
@@ -491,6 +515,23 @@ def _build_report_html(
     
     standup_html = html_escape(standup_digest).replace("\n", "<br>")
     
+    # Stat card colors
+    stalled_color = "#EF4444" if stalled_count > 0 else "#F59E0B"
+    discrepancy_color = "#EF4444" if jira_discrepancy_count > 0 else "#10B981"
+    
+    # Scan summary
+    scan_summary_html = f'''
+    <div class="scan-summary">
+        <h3>Scan Summary</h3>
+        <ul>
+            <li>Repos skipped (abandoned): {repos_skipped}</li>
+            <li>Repos with no open issues: {repos_no_issues}</li>
+            <li>Total issues scanned: {total_issues_scanned}</li>
+            <li>Scan cap: 75 repos, 30 issues/repo</li>
+        </ul>
+    </div>
+    '''
+    
     return f'''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -502,51 +543,59 @@ def _build_report_html(
         body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background: #f8f9fa; color: #212529; }}
         .header {{ background: #002B5C; color: white; padding: 2rem; text-align: center; }}
         .header h1 {{ font-size: 2rem; margin-bottom: 0.5rem; }}
-        .header .timestamp {{ font-size: 0.9rem; opacity: 0.9; }}
+        .header .timestamp {{ font-size: 0.9rem; opacity: 0.9; margin-bottom: 0.25rem; }}
+        .header .duration {{ font-size: 0.85rem; opacity: 0.85; }}
         .dry-run-banner {{ background: #ffc107; color: #212529; padding: 1rem; text-align: center; font-weight: bold; }}
         .container {{ max-width: 1400px; margin: 0 auto; padding: 2rem; }}
         .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1.5rem; margin-bottom: 2rem; }}
-        .stat-card {{ background: white; border-radius: 8px; padding: 1.5rem; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+        .stat-card {{ background: white; border-radius: 8px; padding: 1.5rem; box-shadow: 0 2px 4px rgba(0,0,0,0.1); border-left: 4px solid; }}
         .stat-card h3 {{ font-size: 0.9rem; color: #6c757d; text-transform: uppercase; margin-bottom: 0.5rem; }}
-        .stat-card .value {{ font-size: 2.5rem; font-weight: bold; color: #002B5C; }}
+        .stat-card .value {{ font-size: 2.5rem; font-weight: bold; }}
+        .scan-summary {{ background: #F3F4F6; border-radius: 8px; padding: 1.5rem; margin-bottom: 2rem; }}
+        .scan-summary h3 {{ font-size: 1rem; color: #002B5C; margin-bottom: 1rem; }}
+        .scan-summary ul {{ list-style: none; }}
+        .scan-summary li {{ padding: 0.25rem 0; color: #6c757d; }}
         table {{ width: 100%; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 2rem; }}
         thead {{ background: #002B5C; color: white; }}
         th, td {{ padding: 1rem; text-align: left; border-bottom: 1px solid #dee2e6; }}
         th {{ font-weight: 600; }}
-        tbody tr:hover {{ background: #f8f9fa; }}
+        tbody tr:nth-child(even) {{ background: #F8FAFC; }}
+        tbody tr:hover {{ background: #f1f5f9; }}
         .badge {{ display: inline-block; padding: 0.25rem 0.75rem; border-radius: 4px; color: white; font-size: 0.85rem; font-weight: 500; text-transform: lowercase; }}
         .digest {{ background: white; border-radius: 8px; padding: 2rem; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 2rem; }}
         .digest h2 {{ color: #002B5C; margin-bottom: 1rem; }}
-        .footer {{ text-align: center; padding: 2rem; color: #6c757d; font-size: 0.9rem; }}
+        .footer {{ text-align: center; padding: 2rem; color: #6c757d; font-size: 0.9rem; line-height: 1.6; }}
         h2 {{ color: #002B5C; margin: 2rem 0 1rem 0; }}
     </style>
 </head>
 <body>
     <div class="header">
         <h1>UST-PACE Scrum Master Agent</h1>
-        <div class="timestamp">{html_escape(timestamp)}</div>
+        <div class="timestamp">Generated: {html_escape(timestamp_str)}</div>
+        <div class="duration">Scan completed in {scan_duration:.1f} seconds</div>
     </div>
     <div class="dry-run-banner">DRY RUN MODE — No changes posted to GitHub</div>
     <div class="container">
         <div class="stats">
-            <div class="stat-card">
+            <div class="stat-card" style="border-left-color: #3B82F6;">
                 <h3>Repos Scanned</h3>
-                <div class="value">{repos_scanned}</div>
+                <div class="value" style="color: #3B82F6;">{repos_scanned}</div>
             </div>
-            <div class="stat-card">
+            <div class="stat-card" style="border-left-color: #10B981;">
                 <h3>Active Repos</h3>
-                <div class="value">{active_repos}</div>
+                <div class="value" style="color: #10B981;">{active_repos}</div>
             </div>
-            <div class="stat-card">
+            <div class="stat-card" style="border-left-color: {stalled_color};">
                 <h3>Stalled Issues</h3>
-                <div class="value">{stalled_count}</div>
+                <div class="value" style="color: {stalled_color};">{stalled_count}</div>
             </div>
-            <div class="stat-card">
+            <div class="stat-card" style="border-left-color: {discrepancy_color};">
                 <h3>Jira Discrepancies</h3>
-                <div class="value">{jira_discrepancy_count}</div>
+                <div class="value" style="color: {discrepancy_color};">{jira_discrepancy_count}</div>
             </div>
         </div>
         
+        {scan_summary_html}
         <h2>Repository Issues</h2>
         <table>
             <thead>
@@ -573,7 +622,9 @@ def _build_report_html(
         </div>
     </div>
     <div class="footer">
-        Generated by Scrum Master Agent — Dry Run
+        Generated by Scrum Master Agent — Dry Run<br>
+        Next scheduled run: weekdays at 9:00 AM UTC<br>
+        Agent repo: Aarnav-Gopinath/ScrumMasterAgent
     </div>
 </body>
 </html>'''
@@ -581,6 +632,9 @@ def _build_report_html(
 
 def _run_live_report(now: datetime) -> int:
     """Run live report: scan repos, build HTML, open in browser."""
+    import time
+    start_time = time.time()
+    
     load_dotenv()
     config = load_config()
     token = os.environ.get("GITHUB_TOKEN")
@@ -609,6 +663,9 @@ def _run_live_report(now: datetime) -> int:
     jira_discrepancies: list[dict] = []
     active_repos = 0
     stalled_count = 0
+    repos_skipped = 0
+    repos_no_issues = 0
+    total_issues_scanned = 0
     all_active_stories: list[tuple[Story, StoryStatus, object]] = []
     
     for repo in repos:
@@ -617,11 +674,19 @@ def _run_live_report(now: datetime) -> int:
         
         last_activity = org_client.get_last_repo_activity(repo)
         if is_repo_abandoned(last_activity, now, config.abandoned_days):
+            repos_skipped += 1
             continue
         
         issues = repo_client.get_open_issues(repo)
+
+        if len(issues) == 0:
+            repos_no_issues += 1
+            continue
+
         if len(issues) > _MAX_ISSUES_PER_REPO_DEMO:
             issues = issues[:_MAX_ISSUES_PER_REPO_DEMO]
+
+        total_issues_scanned += len(issues)
         
         repo_issues = []
         for issue in issues:
@@ -642,7 +707,14 @@ def _run_live_report(now: datetime) -> int:
                 if snapshot.last_activity_at
                 else "no activity"
             )
-            action = "Monitor" if status != StoryStatus.STALLED else "Needs attention"
+            
+            # Action based on status
+            if status == StoryStatus.STALLED:
+                action = "Needs attention"
+            elif status == StoryStatus.IN_REVIEW:
+                action = "Awaiting review"
+            else:
+                action = "Active"
             
             repo_issues.append({
                 "number": story.number,
@@ -650,6 +722,7 @@ def _run_live_report(now: datetime) -> int:
                 "assignee": assignee,
                 "status": status.value,
                 "last_activity": last_activity_str,
+                "last_activity_dt": snapshot.last_activity_at,
                 "action": action,
             })
             
@@ -677,16 +750,31 @@ def _run_live_report(now: datetime) -> int:
     # Generate standup digest
     digest = generate_standup_summary(all_active_stories) if all_active_stories else "No active stories detected."
     
+    # Calculate scan duration
+    scan_duration = time.time() - start_time
+    
+    # Format timestamp properly (cross-platform)
+    hour = now.hour if now.hour <= 12 else now.hour - 12
+    if hour == 0:
+        hour = 12
+    am_pm = "AM" if now.hour < 12 else "PM"
+    timestamp_formatted = now.strftime(f"%A, %B %d, %Y at {hour}:%M {am_pm} UTC")
+    
     # Build HTML
     html_content = _build_report_html(
-        timestamp=now.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        timestamp_str=timestamp_formatted,
+        scan_duration=scan_duration,
         repos_scanned=len(repos),
         active_repos=active_repos,
         stalled_count=stalled_count,
         jira_discrepancy_count=len(jira_discrepancies),
+        repos_skipped=repos_skipped,
+        repos_no_issues=repos_no_issues,
+        total_issues_scanned=total_issues_scanned,
         repo_data=repo_data,
         jira_discrepancies=jira_discrepancies,
         standup_digest=digest,
+        now=now,
     )
     
     output_path = "demo-report.html"
@@ -698,6 +786,7 @@ def _run_live_report(now: datetime) -> int:
     print(f"  Active Repos: {active_repos}")
     print(f"  Stalled Issues: {stalled_count}")
     print(f"  Jira Discrepancies: {len(jira_discrepancies)}")
+    print(f"  Scan Duration: {scan_duration:.1f}s")
     
     # Open in browser
     webbrowser.open(f"file://{os.path.abspath(output_path)}")
