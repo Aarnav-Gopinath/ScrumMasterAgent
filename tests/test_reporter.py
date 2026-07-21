@@ -42,8 +42,10 @@ def test_standup_posts_to_configured_issue_with_repo_sections(client, monkeypatc
 
 def test_reporter_skips_abandoned_repo(client, monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    # Abandonment is now checked inside GitHubClient.scan_repo (parallel scan),
+    # not in reporter.py itself — patch it at the source.
     monkeypatch.setattr(
-        "agent.subagents.reporter.is_repo_abandoned",
+        "agent.services.metrics.is_repo_abandoned",
         lambda last_activity, now, abandoned_days: True,
     )
 

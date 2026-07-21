@@ -184,6 +184,22 @@ class _DryRunNotifier(Notifier):
         }
 
 
+def _print_scan_progress(result: dict) -> None:
+    """`on_repo_scanned` callback for scan_all_repos — prints one line per repo as
+    it completes. Called from the main thread only, so prints never interleave."""
+    repo_name = result["repo"]
+    if result.get("skipped"):
+        reason = result.get("reason")
+        if reason == "abandoned":
+            days = result.get("days")
+            days_str = f"{days} days" if days is not None else "no activity"
+            print(f"⊘ {repo_name} — skipped (abandoned, {days_str})")
+        else:
+            print(f"⊘ {repo_name} — skipped (error: {result.get('error')})")
+    else:
+        print(f"✓ {repo_name} — {len(result['stories'])} issues scanned")
+
+
 def _run_live_mode(mode: str, now: datetime) -> int:
     load_dotenv()
     config = load_config()
@@ -231,166 +247,158 @@ def _run_live_mode(mode: str, now: datetime) -> int:
     all_active_stories: list[tuple[Story, StoryStatus, object]] = []
     standup_repo_sections: list[tuple[str, list[tuple[Story, StoryStatus, object]]]] = []
 
-    for repo in repos:
-        repo_name = getattr(repo, "full_name", getattr(repo, "name", "unknown-repo"))
-        print(f"\n=== {repo_name} ===")
-        repo_client = GitHubClient(repo)
-        notifier = _DryRunNotifier(repo_client, repo_name)
-        if mode == "staleness":
-            last_activity = org_client.get_last_repo_activity(repo)
-            if is_repo_abandoned(last_activity, now, config.abandoned_days):
-                if last_activity is None:
-                    print(
-                        f"Skipping {repo_name} — no activity in over {config.abandoned_days} days"
-                    )
+    if mode in {"staleness", "standup"}:
+        print(f"\nScanning {len(repos)} repo(s) in parallel (max_workers=8)...")
+        results = org_client.scan_all_repos(
+            config,
+            now,
+            state=None,
+            jira_client=jira_client,
+            max_repos=repo_cap,
+            max_issues=_MAX_ISSUES_PER_REPO_DEMO,
+            max_workers=8,
+            on_repo_scanned=_print_scan_progress,
+        )
+
+        for result in results:
+            repo_name = result["repo"]
+            print(f"\n=== {repo_name} ===")
+            if result.get("skipped"):
+                reason = result.get("reason")
+                if reason == "abandoned":
+                    days = result.get("days")
+                    if days is None:
+                        print(
+                            f"Skipping {repo_name} — no activity in over "
+                            f"{config.abandoned_days} days"
+                        )
+                    else:
+                        print(f"Skipping {repo_name} — no activity in {days} days")
                 else:
-                    print(f"Skipping {repo_name} — no activity in {(now - last_activity).days} days")
+                    print(f"Skipping {repo_name} — scan error: {result.get('error')}")
                 continue
 
-            summary: list[tuple[int, str]] = []
-            issues = repo_client.get_open_issues(repo)
-            if len(issues) > _MAX_ISSUES_PER_REPO_DEMO:
-                print(
-                    f"  (capping to first {_MAX_ISSUES_PER_REPO_DEMO} of "
-                    f"{len(issues)} open issues — demo mode)"
-                )
-                issues = issues[:_MAX_ISSUES_PER_REPO_DEMO]
-            for issue in issues:
-                story = Story.from_issue(issue)
-                snapshot = build_activity_snapshot(repo_client, story, repo=repo)
-                status = infer_status(
-                    story, snapshot, config.staleness_days, config.business_days_only, now
-                )
-                if status is not StoryStatus.STALLED:
-                    summary.append((story.number, f"skip:{status.value}"))
-                    continue
+            repo = result["repo_obj"]
+            repo_client = GitHubClient(repo)
+            notifier = _DryRunNotifier(repo_client, repo_name)
+            status_by_number = {story.number: status for story, status, _ in result["stories"]}
 
-                committers = repo_client.get_branch_committers(repo, story.number)
-                if committers:
-                    notifier.ask_committers_for_status(
-                        repo, story, committers, config.staleness_days
-                    )
-                    summary.append((story.number, "dry-run:committers"))
-                    teams_notifier = TeamsNotifier.for_repo(repo_name, config)
-                    if teams_notifier is None:
+            if mode == "staleness":
+                summary: list[tuple[int, str]] = []
+                for story, status, snapshot in result["stories"]:
+                    if status is not StoryStatus.STALLED:
+                        summary.append((story.number, f"skip:{status.value}"))
+                        continue
+
+                    committers = repo_client.get_branch_committers(repo, story.number)
+                    if committers:
+                        notifier.ask_committers_for_status(
+                            repo, story, committers, config.staleness_days
+                        )
+                        summary.append((story.number, "dry-run:committers"))
+                        teams_notifier = TeamsNotifier.for_repo(repo_name, config)
+                        if teams_notifier is None:
+                            print(
+                                f"Teams routing: {repo_name} → "
+                                "no channel configured (add webhook to config.yml)"
+                            )
+                        else:
+                            print(
+                                f"Teams routing: {repo_name} → "
+                                "channel configured"
+                            )
                         print(
-                            f"Teams routing: {repo_name} → "
-                            "no channel configured (add webhook to config.yml)"
+                            f"DRY RUN outreach targets for #{story.number}: "
+                            f"{', '.join(committers)}"
                         )
                     else:
+                        notifier.remind_assignee(story, config.staleness_days, repo=repo)
+                        summary.append((story.number, "dry-run:assignee"))
+                        teams_notifier = TeamsNotifier.for_repo(repo_name, config)
+                        if teams_notifier is None:
+                            print(
+                                f"Teams routing: {repo_name} → "
+                                "no channel configured (add webhook to config.yml)"
+                            )
+                        else:
+                            print(
+                                f"Teams routing: {repo_name} → "
+                                "channel configured"
+                            )
                         print(
-                            f"Teams routing: {repo_name} → "
-                            "channel configured"
+                            f"DRY RUN outreach targets for #{story.number}: "
+                            "(none found, fallback to assignee)"
                         )
-                    print(
-                        f"DRY RUN outreach targets for #{story.number}: "
-                        f"{', '.join(committers)}"
-                    )
-                else:
-                    notifier.remind_assignee(story, config.staleness_days, repo=repo)
-                    summary.append((story.number, "dry-run:assignee"))
-                    teams_notifier = TeamsNotifier.for_repo(repo_name, config)
-                    if teams_notifier is None:
-                        print(
-                            f"Teams routing: {repo_name} → "
-                            "no channel configured (add webhook to config.yml)"
-                        )
-                    else:
-                        print(
-                            f"Teams routing: {repo_name} → "
-                            "channel configured"
-                        )
-                    print(
-                        f"DRY RUN outreach targets for #{story.number}: "
-                        "(none found, fallback to assignee)"
-                    )
 
-                # Jira discrepancy dry-run output for stalled stories.
+                    # Jira discrepancy dry-run output for stalled stories.
+                    if jira_client is not None:
+                        from agent.models import describe_discrepancy
+                        discrepancies = [
+                            d for d in result["discrepancies"] if d.issue_number == story.number
+                        ]
+                        for d in discrepancies:
+                            print(
+                                f"JIRA DISCREPANCY — would post to issue #{story.number} "
+                                f"in {repo_name}:\n"
+                                f"{describe_discrepancy(d)}"
+                            )
+                print(f"summary: {summary}")
+            elif mode == "standup":
+                repo_active_stories: list[tuple[Story, StoryStatus, object]] = [
+                    (story, status, snapshot)
+                    for story, status, snapshot in result["stories"]
+                    if status in {StoryStatus.IN_PROGRESS, StoryStatus.IN_REVIEW, StoryStatus.STALLED}
+                ]
+                repo_discrepancies: list[tuple[str, object]] = []
                 if jira_client is not None:
-                    from agent.models import describe_discrepancy
-                    from agent.services.metrics import detect_jira_discrepancies
-                    discrepancies = detect_jira_discrepancies(
-                        story, snapshot, status, jira_client, config.staleness_days, now
-                    )
-                    for d in discrepancies:
+                    for d in result["discrepancies"]:
+                        if status_by_number.get(d.issue_number) in {
+                            StoryStatus.IN_PROGRESS,
+                            StoryStatus.STALLED,
+                        }:
+                            repo_discrepancies.append((repo_name, d))
+
+                print(f"=== {repo_name} ({len(repo_active_stories)} active stories) ===")
+                for story, status, _snapshot in repo_active_stories:
+                    print(f"  - #{story.number} {story.title} [{status.value}]")
+
+                if repo_discrepancies:
+                    print(f"\nJira discrepancies in {repo_name}:")
+                    for _rname, d in repo_discrepancies:
+                        from agent.models import describe_discrepancy
                         print(
-                            f"JIRA DISCREPANCY — would post to issue #{story.number} "
+                            f"  JIRA DISCREPANCY — would post to issue #{d.issue_number} "
                             f"in {repo_name}:\n"
-                            f"{describe_discrepancy(d)}"
+                            f"  {describe_discrepancy(d)}"
                         )
-            print(f"summary: {summary}")
-        elif mode == "standup":
-            last_activity = org_client.get_last_repo_activity(repo)
-            if is_repo_abandoned(last_activity, now, config.abandoned_days):
-                if last_activity is None:
-                    print(
-                        f"Skipping {repo_name} — no activity in over {config.abandoned_days} days"
-                    )
+
+                teams_notifier = TeamsNotifier.for_repo(repo_name, config)
+                if teams_notifier is None:
+                    print(f"Teams routing: {repo_name} → no channel configured (teams list empty)")
                 else:
-                    print(f"Skipping {repo_name} — no activity in {(now - last_activity).days} days")
-                continue
+                    print(f"Teams routing: {repo_name} → channel configured")
 
-            repo_active_stories: list[tuple[Story, StoryStatus, object]] = []
-            repo_discrepancies: list[tuple[str, object]] = []
-            issues = repo_client.get_open_issues(repo)
-            if len(issues) > _MAX_ISSUES_PER_REPO_DEMO:
-                print(
-                    f"  (capping to first {_MAX_ISSUES_PER_REPO_DEMO} of "
-                    f"{len(issues)} open issues — demo mode)"
-                )
-                issues = issues[:_MAX_ISSUES_PER_REPO_DEMO]
-            for issue in issues:
-                story = Story.from_issue(issue)
-                snapshot = build_activity_snapshot(repo_client, story, repo=repo)
-                status = infer_status(
-                    story, snapshot, config.staleness_days, config.business_days_only, now
-                )
-                if status in {StoryStatus.IN_PROGRESS, StoryStatus.IN_REVIEW, StoryStatus.STALLED}:
-                    repo_active_stories.append((story, status, snapshot))
-                if jira_client is not None and status in {StoryStatus.IN_PROGRESS, StoryStatus.STALLED}:
-                    from agent.models import describe_discrepancy
-                    from agent.services.metrics import detect_jira_discrepancies
-                    discs = detect_jira_discrepancies(
-                        story, snapshot, status, jira_client, config.staleness_days, now
-                    )
-                    for d in discs:
-                        repo_discrepancies.append((repo_name, d))
-
-            print(f"=== {repo_name} ({len(repo_active_stories)} active stories) ===")
-            for story, status, _snapshot in repo_active_stories:
-                print(f"  - #{story.number} {story.title} [{status.value}]")
-
-            if repo_discrepancies:
-                print(f"\nJira discrepancies in {repo_name}:")
-                for _rname, d in repo_discrepancies:
-                    from agent.models import describe_discrepancy
-                    print(
-                        f"  JIRA DISCREPANCY — would post to issue #{d.issue_number} "
-                        f"in {repo_name}:\n"
-                        f"  {describe_discrepancy(d)}"
-                    )
-
-            teams_notifier = TeamsNotifier.for_repo(repo_name, config)
-            if teams_notifier is None:
-                print(f"Teams routing: {repo_name} → no channel configured (teams list empty)")
+                if repo_active_stories:
+                    all_active_stories.extend(repo_active_stories)
+                    standup_repo_sections.append((repo_name, repo_active_stories))
+    else:
+        for repo in repos:
+            repo_name = getattr(repo, "full_name", getattr(repo, "name", "unknown-repo"))
+            print(f"\n=== {repo_name} ===")
+            repo_client = GitHubClient(repo)
+            notifier = _DryRunNotifier(repo_client, repo_name)
+            if mode == "pr_watcher":
+                if event_payload:
+                    summary = pr_watcher.run(repo_client, config, event_payload, notifier=notifier)
+                else:
+                    summary = pr_watcher.check_stale_prs(repo_client, config, now, notifier=notifier)
+                print(f"summary: {summary}")
+            elif mode == "completion":
+                result = completion.run(repo_client, config, event_payload, notifier=notifier)
+                print(f"result: {result}")
             else:
-                print(f"Teams routing: {repo_name} → channel configured")
-
-            if repo_active_stories:
-                all_active_stories.extend(repo_active_stories)
-                standup_repo_sections.append((repo_name, repo_active_stories))
-        elif mode == "pr_watcher":
-            if event_payload:
-                summary = pr_watcher.run(repo_client, config, event_payload, notifier=notifier)
-            else:
-                summary = pr_watcher.check_stale_prs(repo_client, config, now, notifier=notifier)
-            print(f"summary: {summary}")
-        elif mode == "completion":
-            result = completion.run(repo_client, config, event_payload, notifier=notifier)
-            print(f"result: {result}")
-        else:
-            logger.warning("Unknown live mode %s", mode)
-            return 2
+                logger.warning("Unknown live mode %s", mode)
+                return 2
 
     if mode == "standup":
         heading = f"## Daily Standup — {now.date().isoformat()}"
@@ -643,14 +651,7 @@ def _run_live_report(now: datetime) -> int:
         return 1
     
     org_client = GitHubClient.from_org_token(token=token, org_name=config.org_name)
-    repos = org_client.get_org_repos(exclude_repo=config.agent_repo, max_repos=75)
-    
-    if not repos:
-        print("No repos found after exclusions.")
-        return 1
-    
-    print(f"Scanning {len(repos)} repos (max_repos=75, max_issues_per_repo=30)...")
-    
+
     # Build Jira client
     jira_client = None
     try:
@@ -658,7 +659,23 @@ def _run_live_report(now: datetime) -> int:
         jira_client = JiraClient.from_env()
     except Exception:  # noqa: BLE001
         pass
-    
+
+    print("Scanning repos in parallel (max_repos=75, max_issues_per_repo=30, max_workers=8)...")
+    results = org_client.scan_all_repos(
+        config,
+        now,
+        state=None,
+        jira_client=jira_client,
+        max_repos=75,
+        max_issues=_MAX_ISSUES_PER_REPO_DEMO,
+        max_workers=8,
+        on_repo_scanned=_print_scan_progress,
+    )
+
+    if not results:
+        print("No repos found after exclusions.")
+        return 1
+
     repo_data: list[dict] = []
     jira_discrepancies: list[dict] = []
     active_repos = 0
@@ -667,47 +684,35 @@ def _run_live_report(now: datetime) -> int:
     repos_no_issues = 0
     total_issues_scanned = 0
     all_active_stories: list[tuple[Story, StoryStatus, object]] = []
-    
-    for repo in repos:
-        repo_name = getattr(repo, "full_name", getattr(repo, "name", "unknown-repo"))
-        repo_client = GitHubClient(repo)
-        
-        last_activity = org_client.get_last_repo_activity(repo)
-        if is_repo_abandoned(last_activity, now, config.abandoned_days):
+
+    for result in results:
+        repo_name = result["repo"]
+
+        if result.get("skipped"):
             repos_skipped += 1
             continue
-        
-        issues = repo_client.get_open_issues(repo)
 
-        if len(issues) == 0:
+        stories = result["stories"]
+        if len(stories) == 0:
             repos_no_issues += 1
             continue
 
-        if len(issues) > _MAX_ISSUES_PER_REPO_DEMO:
-            issues = issues[:_MAX_ISSUES_PER_REPO_DEMO]
+        total_issues_scanned += len(stories)
 
-        total_issues_scanned += len(issues)
-        
         repo_issues = []
-        for issue in issues:
-            story = Story.from_issue(issue)
-            snapshot = build_activity_snapshot(repo_client, story, repo=repo)
-            status = infer_status(
-                story, snapshot, config.staleness_days, config.business_days_only, now
-            )
-            
+        for story, status, snapshot in stories:
             if status not in {StoryStatus.IN_PROGRESS, StoryStatus.IN_REVIEW, StoryStatus.STALLED}:
                 continue
-            
+
             all_active_stories.append((story, status, snapshot))
-            
+
             assignee = story.assignees[0] if story.assignees else "(unassigned)"
             last_activity_str = (
                 snapshot.last_activity_at.strftime("%Y-%m-%d")
                 if snapshot.last_activity_at
                 else "no activity"
             )
-            
+
             # Action based on status
             if status == StoryStatus.STALLED:
                 action = "Needs attention"
@@ -715,7 +720,7 @@ def _run_live_report(now: datetime) -> int:
                 action = "Awaiting review"
             else:
                 action = "Active"
-            
+
             repo_issues.append({
                 "number": story.number,
                 "title": story.title,
@@ -725,28 +730,26 @@ def _run_live_report(now: datetime) -> int:
                 "last_activity_dt": snapshot.last_activity_at,
                 "action": action,
             })
-            
+
             if status == StoryStatus.STALLED:
                 stalled_count += 1
-            
-            # Jira discrepancies
-            if jira_client and status in {StoryStatus.IN_PROGRESS, StoryStatus.STALLED}:
-                from agent.models import describe_discrepancy
-                from agent.services.metrics import detect_jira_discrepancies
-                discs = detect_jira_discrepancies(
-                    story, snapshot, status, jira_client, config.staleness_days, now
-                )
-                for d in discs:
+
+        # Jira discrepancies (same IN_PROGRESS/STALLED restriction as before).
+        if jira_client:
+            from agent.models import describe_discrepancy
+            status_by_number = {story.number: status for story, status, _ in stories}
+            for d in result["discrepancies"]:
+                if status_by_number.get(d.issue_number) in {StoryStatus.IN_PROGRESS, StoryStatus.STALLED}:
                     jira_discrepancies.append({
                         "repo_name": repo_name,
-                        "issue_number": story.number,
+                        "issue_number": d.issue_number,
                         "description": describe_discrepancy(d),
                     })
-        
+
         if repo_issues:
             active_repos += 1
             repo_data.append({"repo_name": repo_name, "issues": repo_issues})
-    
+
     # Generate standup digest
     digest = generate_standup_summary(all_active_stories) if all_active_stories else "No active stories detected."
     
@@ -764,7 +767,7 @@ def _run_live_report(now: datetime) -> int:
     html_content = _build_report_html(
         timestamp_str=timestamp_formatted,
         scan_duration=scan_duration,
-        repos_scanned=len(repos),
+        repos_scanned=len(results),
         active_repos=active_repos,
         stalled_count=stalled_count,
         jira_discrepancy_count=len(jira_discrepancies),
@@ -782,7 +785,7 @@ def _run_live_report(now: datetime) -> int:
         fh.write(html_content)
     
     print(f"\n✓ Report generated: {output_path}")
-    print(f"  Repos Scanned: {len(repos)}")
+    print(f"  Repos Scanned: {len(results)}")
     print(f"  Active Repos: {active_repos}")
     print(f"  Stalled Issues: {stalled_count}")
     print(f"  Jira Discrepancies: {len(jira_discrepancies)}")

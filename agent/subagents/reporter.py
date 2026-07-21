@@ -11,7 +11,6 @@ from agent.models import ActivitySnapshot, Story, StoryStatus
 from agent.services.config import Config
 from agent.services.github_client import GitHubClient
 from agent.services.llm import generate_standup_summary
-from agent.services.metrics import build_activity_snapshot, detect_jira_discrepancies, infer_status, is_repo_abandoned
 from agent.services.notifier import Notifier
 from agent.services.teams_notifier import TeamsNotifier
 
@@ -51,49 +50,49 @@ def run(
     post_client = GitHubClient(target_repo)
     notifier = notifier or Notifier(post_client)
 
-    try:
-        repos = client.get_org_repos(exclude_repo=config.agent_repo, max_repos=75)
-    except ValueError:
-        # Fixture/offline mode: a single injected repo is all we have.
-        repos = [client.repo] if client.repo is not None else []
+    # Scanning (activity/issues/status/discrepancies) runs in parallel across repos —
+    # see GitHubClient.scan_all_repos. Falls back to the single injected repo in
+    # fixture/offline mode.
+    results = client.scan_all_repos(
+        config, now, state=state, jira_client=jira_client, max_repos=75, max_issues=30
+    )
 
-    logger.info("Reporter scanning %d repo(s).", len(repos))
+    logger.info("Reporter scanning %d repo(s).", len(results))
 
     repo_summaries: list[dict] = []
     all_discrepancies: list[tuple[str, object]] = []  # (repo_name, JiraDiscrepancy)
 
-    for repo in repos:
-        repo_name = getattr(repo, "full_name", getattr(repo, "name", "unknown-repo"))
-        last_activity = client.get_last_repo_activity(repo, state=state, now=now)
-        if is_repo_abandoned(last_activity, now, config.abandoned_days):
-            if last_activity is None:
-                logger.info(
-                    "Skipping %s — no activity in over %d days",
-                    repo_name,
-                    config.abandoned_days,
-                )
+    for result in results:
+        repo_name = result["repo"]
+        if result.get("skipped"):
+            reason = result.get("reason")
+            if reason == "abandoned":
+                days = result.get("days")
+                if days is None:
+                    logger.info(
+                        "Skipping %s — no activity in over %d days",
+                        repo_name,
+                        config.abandoned_days,
+                    )
+                else:
+                    logger.info("Skipping %s — no activity in %d days", repo_name, days)
             else:
-                logger.info(
-                    "Skipping %s — no activity in %d days",
-                    repo_name,
-                    (now - last_activity).days,
-                )
+                logger.warning("Skipping %s — scan error: %s", repo_name, result.get("error"))
             continue
 
-        stories: list[tuple[Story, StoryStatus, ActivitySnapshot]] = []
-        for issue in client.get_open_issues(repo):
-            story = Story.from_issue(issue)
-            snapshot = build_activity_snapshot(client, story, repo=repo)
-            status = infer_status(
-                story, snapshot, config.staleness_days, config.business_days_only, now
-            )
-            if status in _ACTIVE_STATUSES:
-                stories.append((story, status, snapshot))
-            if jira_client is not None and status in _DISCREPANCY_STATUSES:
-                discrepancies = detect_jira_discrepancies(
-                    story, snapshot, status, jira_client, config.staleness_days, now
-                )
-                for d in discrepancies:
+        stories: list[tuple[Story, StoryStatus, ActivitySnapshot]] = [
+            (story, status, snapshot)
+            for story, status, snapshot in result["stories"]
+            if status in _ACTIVE_STATUSES
+        ]
+        if jira_client is not None:
+            # scan_repo computes discrepancies for every issue; restrict to the
+            # same statuses the pre-parallel loop checked (IN_PROGRESS/STALLED)
+            # so reporter output doesn't change for issues that were never
+            # considered here before (e.g. IN_REVIEW, NOT_STARTED).
+            status_by_number = {story.number: status for story, status, _ in result["stories"]}
+            for d in result["discrepancies"]:
+                if status_by_number.get(d.issue_number) in _DISCREPANCY_STATUSES:
                     all_discrepancies.append((repo_name, d))
 
         logger.info("%s active stories found in %s", len(stories), repo_name)

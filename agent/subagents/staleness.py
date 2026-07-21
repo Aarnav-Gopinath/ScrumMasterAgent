@@ -12,10 +12,9 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from agent.models import Story, StoryStatus
+from agent.models import StoryStatus
 from agent.services.config import Config
 from agent.services.github_client import GitHubClient
-from agent.services.metrics import build_activity_snapshot, detect_jira_discrepancies, infer_status, is_repo_abandoned
 from agent.services.notifier import AGENT_COMMENT_MARKER, Notifier
 from agent.services.state import record_reminder, save_state, should_remind
 
@@ -35,33 +34,32 @@ def run(
     notifier = notifier or Notifier(client)
     summary: list[tuple[int, str]] = []
 
-    try:
-        repos = client.get_org_repos(exclude_repo=config.agent_repo)
-    except ValueError:
-        repos = [client.repo] if client.repo is not None else []
+    # Scanning (activity/issues/status/discrepancies) runs in parallel across repos;
+    # notifications and state writes below stay sequential — see scan_all_repos.
+    results = client.scan_all_repos(
+        config, now, state=state, jira_client=jira_client, max_repos=None, max_issues=30
+    )
 
-    for repo in repos:
-        last_activity = client.get_last_repo_activity(repo, state=state, now=now)
-        repo_name = getattr(repo, "full_name", getattr(repo, "name", "unknown-repo"))
-        if is_repo_abandoned(last_activity, now, config.abandoned_days):
-            if last_activity is None:
-                logger.info(
-                    "Skipping %s — no activity in over %d days",
-                    repo_name,
-                    config.abandoned_days,
-                )
+    for result in results:
+        repo_name = result["repo"]
+        if result.get("skipped"):
+            reason = result.get("reason")
+            if reason == "abandoned":
+                days = result.get("days")
+                if days is None:
+                    logger.info(
+                        "Skipping %s — no activity in over %d days",
+                        repo_name,
+                        config.abandoned_days,
+                    )
+                else:
+                    logger.info("Skipping %s — no activity in %d days", repo_name, days)
             else:
-                days_inactive = (now - last_activity).days
-                logger.info("Skipping %s — no activity in %d days", repo_name, days_inactive)
+                logger.warning("Skipping %s — scan error: %s", repo_name, result.get("error"))
             continue
 
-        for issue in client.get_open_issues(repo):
-            story = Story.from_issue(issue)
-            snapshot = build_activity_snapshot(client, story, repo=repo)
-            status = infer_status(
-                story, snapshot, config.staleness_days, config.business_days_only, now
-            )
-
+        repo = result["repo_obj"]
+        for story, status, snapshot in result["stories"]:
             if status is not StoryStatus.STALLED:
                 logger.info("#%s is %s — no reminder needed", story.number, status.value)
                 summary.append((story.number, f"skip:{status.value}"))
@@ -92,9 +90,9 @@ def run(
             # Jira discrepancy check — runs only when a reminder is also due.
             if jira_client is not None:
                 from agent.models import describe_discrepancy
-                discrepancies = detect_jira_discrepancies(
-                    story, snapshot, status, jira_client, config.staleness_days, now
-                )
+                discrepancies = [
+                    d for d in result["discrepancies"] if d.issue_number == story.number
+                ]
                 if discrepancies:
                     types = [d.discrepancy_type for d in discrepancies]
                     logger.info("Jira discrepancy found for #%s: %s", story.number, types)

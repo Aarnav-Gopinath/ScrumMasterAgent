@@ -145,6 +145,39 @@ class GitHubClient:
         )
         return repos
 
+    def _probe_repo_activity_cache(
+        self, repo_name: str, state: dict, now: datetime
+    ) -> tuple[bool, Optional[datetime]]:
+        """Read-only cache lookup: (hit, value). Never mutates `state`.
+
+        Split out of `get_last_repo_activity` so `scan_repo` can share the same TTL
+        logic while running on a worker thread — cache *writes* are not thread-safe
+        by construction (last-write-wins across concurrent scans), so callers that
+        run in parallel must read here and write later, serially, once all threads
+        have finished. See `scan_all_repos`.
+        """
+        from agent.services.state import get_cached_repo_activity
+
+        cache_entry = state.get("repo_cache", {}).get(repo_name)
+        if cache_entry is None:
+            return False, None
+
+        cached_value = get_cached_repo_activity(state, repo_name, now=now)
+        if cached_value is not None:
+            logger.debug("Cache hit for repo activity: %s", repo_name)
+            return True, cached_value
+
+        # Entry exists but value is None (no activity) — still a hit if fresh.
+        cached_at_raw = cache_entry.get("cached_at")
+        if cached_at_raw:
+            cached_at = datetime.fromisoformat(cached_at_raw)
+            age_hours = (now - cached_at).total_seconds() / 3600
+            if age_hours <= 6:  # default TTL
+                logger.debug("Cache hit (no activity) for repo: %s", repo_name)
+                return True, None
+
+        return False, None
+
     def get_last_repo_activity(
         self, repo, state: Optional[dict] = None, now: Optional[datetime] = None
     ) -> Optional[datetime]:
@@ -161,26 +194,11 @@ class GitHubClient:
         )
 
         if state is not None and now is not None:
-            from agent.services.state import cache_repo_activity, get_cached_repo_activity
+            from agent.services.state import cache_repo_activity
 
-            # Check for a fresh cache entry. We also look at the raw entry to
-            # handle the "cached as None (no activity)" case correctly.
-            cache_entry = state.get("repo_cache", {}).get(repo_name)
-            if cache_entry is not None:
-                cached_value = get_cached_repo_activity(state, repo_name, now=now)
-                if cached_value is not None:
-                    logger.debug("Cache hit for repo activity: %s", repo_name)
-                    return cached_value
-                # Entry exists but value is None (no activity) — still a hit if fresh.
-                cached_at_raw = cache_entry.get("cached_at")
-                if cached_at_raw:
-                    cached_at = datetime.fromisoformat(cached_at_raw)
-                    age_hours = (now - cached_at).total_seconds() / 3600
-                    if age_hours <= 6:  # default TTL
-                        logger.debug(
-                            "Cache hit (no activity) for repo: %s", repo_name
-                        )
-                        return None
+            hit, cached_value = self._probe_repo_activity_cache(repo_name, state, now)
+            if hit:
+                return cached_value
 
             result = self._fetch_last_repo_activity(source_repo)
             cache_repo_activity(state, repo_name, result, now)
@@ -378,6 +396,174 @@ class GitHubClient:
             getattr(source_repo, "full_name", getattr(source_repo, "name", "unknown-repo")),
         )
         return seen
+
+    # ----- parallel org scan --------------------------------------------------
+
+    def scan_repo(
+        self,
+        repo,
+        config,
+        now: datetime,
+        state: Optional[dict] = None,
+        jira_client=None,
+        max_issues: int = 30,
+    ) -> dict:
+        """Run the full per-repo scan (activity, issues, status, Jira discrepancies).
+
+        Designed to be called from a worker thread by `scan_all_repos`, so it never
+        raises — any failure is caught and reported in the returned dict instead,
+        so one bad repo can't abort the whole batch. It also never *writes* to
+        `state`; it only reads the repo-activity cache (see
+        `_probe_repo_activity_cache`) and reports what it found via the
+        `last_activity` / `cache_hit` keys so the caller can apply the cache write
+        serially once every thread has finished.
+
+        Imports metrics/models lazily to avoid a circular import (metrics.py
+        imports GitHubClient).
+        """
+        from agent.models import Story
+        from agent.services.metrics import (
+            build_activity_snapshot,
+            detect_jira_discrepancies,
+            infer_status,
+            is_repo_abandoned,
+        )
+
+        repo_name = getattr(repo, "full_name", getattr(repo, "name", "unknown-repo"))
+        try:
+            if state is not None:
+                cache_hit, last_activity = self._probe_repo_activity_cache(repo_name, state, now)
+            else:
+                cache_hit, last_activity = False, None
+            if not cache_hit:
+                last_activity = self._fetch_last_repo_activity(repo)
+
+            if is_repo_abandoned(last_activity, now, config.abandoned_days):
+                days = (now - last_activity).days if last_activity is not None else None
+                return {
+                    "repo": repo_name,
+                    "repo_obj": repo,
+                    "skipped": True,
+                    "reason": "abandoned",
+                    "days": days,
+                    "last_activity": last_activity,
+                    "cache_hit": cache_hit,
+                }
+
+            issues = self.get_open_issues(repo)
+            if len(issues) > max_issues:
+                issues = issues[:max_issues]
+
+            stories: list[tuple] = []
+            discrepancies: list = []
+            for issue in issues:
+                story = Story.from_issue(issue)
+                snapshot = build_activity_snapshot(self, story, repo=repo)
+                status = infer_status(
+                    story, snapshot, config.staleness_days, config.business_days_only, now
+                )
+                stories.append((story, status, snapshot))
+
+                if jira_client is not None:
+                    discrepancies.extend(
+                        detect_jira_discrepancies(
+                            story, snapshot, status, jira_client, config.staleness_days, now
+                        )
+                    )
+
+            return {
+                "repo": repo_name,
+                "repo_obj": repo,
+                "skipped": False,
+                "stories": stories,
+                "discrepancies": discrepancies,
+                "last_activity": last_activity,
+                "cache_hit": cache_hit,
+            }
+        except Exception as exc:  # noqa: BLE001 — one bad repo must never crash the batch.
+            logger.exception("scan_repo failed for %s", repo_name)
+            return {
+                "repo": repo_name,
+                "repo_obj": repo,
+                "skipped": True,
+                "reason": "error",
+                "error": str(exc),
+            }
+
+    def scan_all_repos(
+        self,
+        config,
+        now: datetime,
+        state: Optional[dict] = None,
+        jira_client=None,
+        max_repos: Optional[int] = None,
+        max_issues: int = 30,
+        max_workers: int = 8,
+        on_repo_scanned=None,
+    ) -> list[dict]:
+        """Scan every org repo in parallel via a thread pool, returning result dicts.
+
+        The repo list is fetched first (one fast, sequential API call), then each
+        repo's `scan_repo` runs on a worker thread — PyGitHub's read calls are
+        thread-safe, and `scan_repo` isolates its own exceptions, so a single bad
+        repo never aborts the batch. Results are collected in completion order
+        (not input order). `on_repo_scanned`, if given, is invoked once per
+        completed repo from the main thread (never from a worker thread) so
+        callers can print live progress without worrying about interleaved output.
+
+        Falls back to the single injected `self.repo` when no org client is
+        configured (offline/fixture mode), mirroring the pre-parallel sequential
+        loops in staleness.py / reporter.py.
+
+        Cache writes for repo-activity are applied here, serially, after every
+        future has resolved — never inside a worker thread.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        from agent.services.state import cache_repo_activity
+
+        try:
+            repos = self.get_org_repos(exclude_repo=config.agent_repo, max_repos=max_repos)
+        except ValueError:
+            repos = [self.repo] if self.repo is not None else []
+
+        total = len(repos)
+        results: list[dict] = []
+        completed = 0
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_repo = {
+                pool.submit(self.scan_repo, repo, config, now, state, jira_client, max_issues): repo
+                for repo in repos
+            }
+            for future in as_completed(future_to_repo):
+                repo = future_to_repo[future]
+                try:
+                    result = future.result()
+                except Exception as exc:  # noqa: BLE001 — safety net; scan_repo already catches.
+                    repo_name = getattr(repo, "full_name", getattr(repo, "name", "unknown-repo"))
+                    logger.exception("Unexpected failure scanning %s", repo_name)
+                    result = {
+                        "repo": repo_name,
+                        "repo_obj": repo,
+                        "skipped": True,
+                        "reason": "error",
+                        "error": str(exc),
+                    }
+
+                results.append(result)
+                completed += 1
+                if on_repo_scanned is not None:
+                    on_repo_scanned(result)
+                if completed % 10 == 0 or completed == total:
+                    logger.info("Scanned %d/%d repos...", completed, total)
+
+        if state is not None:
+            for result in results:
+                if not result.get("cache_hit"):
+                    cache_repo_activity(state, result["repo"], result.get("last_activity"), now)
+
+        return results
 
     # ----- writes ------------------------------------------------------------
 
