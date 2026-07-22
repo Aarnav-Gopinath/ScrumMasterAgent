@@ -983,6 +983,16 @@ def _post_test_comment() -> tuple[int, Optional[str]]:
     issue = client.get_issue(test_issue_number)
     print(f"Fetched issue #{test_issue_number}: {issue.title}")
 
+    # Idempotency: skip posting if the agent has already commented on this
+    # issue (same marker the staleness/notifier code uses to recognize its
+    # own comments), so re-running the demo doesn't spam duplicate comments.
+    for existing in client.get_comments(test_issue_number):
+        if AGENT_COMMENT_MARKER in (getattr(existing, "body", "") or ""):
+            existing_url = getattr(existing, "html_url", None)
+            print(f"✓ Demo comment already exists on issue #{test_issue_number} — skipping post")
+            print(f"  View it at: {existing_url}")
+            return 0, existing_url
+
     comment = client.post_comment(test_issue_number, _TEST_POST_COMMENT_BODY)
 
     print(f"Comment URL: {comment.html_url}")
