@@ -14,9 +14,11 @@ import html as _html_module
 import json
 import logging
 import os
+import re
 import sys
 import webbrowser
 from datetime import datetime, timezone
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -416,6 +418,118 @@ def _run_live_mode(mode: str, now: datetime) -> int:
     return 0
 
 
+def _apply_inline_markdown(text: str) -> str:
+    """**bold** / *em* → <strong>/<em>. `text` must already be HTML-escaped."""
+    text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
+    text = re.sub(r"\*(.+?)\*", r"<em>\1</em>", text)
+    return text
+
+
+def _split_table_row(row: str) -> list[str]:
+    """Split a `| a | b |` markdown row into its trimmed cell strings."""
+    cells = row.strip()
+    if cells.startswith("|"):
+        cells = cells[1:]
+    if cells.endswith("|"):
+        cells = cells[:-1]
+    return [c.strip() for c in cells.split("|")]
+
+
+def _markdown_to_html(markdown_text: str) -> str:
+    """Convert a small, known subset of Markdown to HTML for the standup digest.
+
+    Deliberately not a general-purpose Markdown renderer — the digest comes from
+    either Claude's output or `_fallback_summary`, both of which only ever use
+    headings, bold/italic, horizontal rules, bullet lists, blank-line paragraphs,
+    and (occasionally, from Claude) pipe tables. Every line is HTML-escaped before
+    any tag is added, so nothing in the source text (e.g. an issue title copied
+    into the digest) can inject markup.
+    """
+    html_escape = _html_module.escape
+    html_parts: list[str] = []
+    list_buffer: list[str] = []
+    table_buffer: list[str] = []
+    paragraph_buffer: list[str] = []
+
+    def flush_list() -> None:
+        if list_buffer:
+            items = "".join(f"<li>{item}</li>" for item in list_buffer)
+            html_parts.append(f"<ul>{items}</ul>")
+            list_buffer.clear()
+
+    def flush_table() -> None:
+        if not table_buffer:
+            return
+        rows = list(table_buffer)
+        table_buffer.clear()
+        body_rows = rows
+        header_cells = None
+        if len(rows) >= 2 and re.fullmatch(r"\|?[\s:|-]+\|?", rows[1]):
+            header_cells = [_apply_inline_markdown(c) for c in _split_table_row(rows[0])]
+            body_rows = rows[2:]
+        parts = ["<table>"]
+        if header_cells is not None:
+            parts.append("<tr>" + "".join(f"<th>{c}</th>" for c in header_cells) + "</tr>")
+        for row in body_rows:
+            cells = [_apply_inline_markdown(c) for c in _split_table_row(row)]
+            parts.append("<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>")
+        parts.append("</table>")
+        html_parts.append("".join(parts))
+
+    def flush_paragraph() -> None:
+        if paragraph_buffer:
+            html_parts.append("<p>" + " ".join(paragraph_buffer) + "</p>")
+            paragraph_buffer.clear()
+
+    for raw_line in markdown_text.split("\n"):
+        stripped = html_escape(raw_line.strip())
+
+        if stripped == "":
+            flush_list()
+            flush_table()
+            flush_paragraph()
+            continue
+
+        heading2 = re.match(r"^##\s+(.*)$", stripped)
+        heading3 = re.match(r"^###\s+(.*)$", stripped)
+        is_hr = stripped in ("---", "***", "___")
+        list_item = re.match(r"^-\s+(.*)$", stripped)
+        is_table_row = stripped.startswith("|") and stripped.endswith("|")
+
+        if heading2:
+            flush_list()
+            flush_table()
+            flush_paragraph()
+            html_parts.append(f"<h2>{_apply_inline_markdown(heading2.group(1))}</h2>")
+        elif heading3:
+            flush_list()
+            flush_table()
+            flush_paragraph()
+            html_parts.append(f"<h3>{_apply_inline_markdown(heading3.group(1))}</h3>")
+        elif is_hr:
+            flush_list()
+            flush_table()
+            flush_paragraph()
+            html_parts.append("<hr>")
+        elif list_item:
+            flush_table()
+            flush_paragraph()
+            list_buffer.append(_apply_inline_markdown(list_item.group(1)))
+        elif is_table_row:
+            flush_list()
+            flush_paragraph()
+            table_buffer.append(stripped)
+        else:
+            flush_list()
+            flush_table()
+            paragraph_buffer.append(_apply_inline_markdown(stripped))
+
+    flush_list()
+    flush_table()
+    flush_paragraph()
+    return "\n".join(html_parts)
+
+
 def _build_report_html(
     timestamp_str: str,
     scan_duration: float,
@@ -521,7 +635,7 @@ def _build_report_html(
         </table>
         '''
     
-    standup_html = html_escape(standup_digest).replace("\n", "<br>")
+    standup_html = _markdown_to_html(standup_digest)
     
     # Stat card colors
     stalled_color = "#EF4444" if stalled_count > 0 else "#F59E0B"
@@ -572,6 +686,9 @@ def _build_report_html(
         .badge {{ display: inline-block; padding: 0.25rem 0.75rem; border-radius: 4px; color: white; font-size: 0.85rem; font-weight: 500; text-transform: lowercase; }}
         .digest {{ background: white; border-radius: 8px; padding: 2rem; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 2rem; }}
         .digest h2 {{ color: #002B5C; margin-bottom: 1rem; }}
+        .digest table {{ border-collapse: collapse; margin: 1rem 0; }}
+        .digest th {{ background: #f1f5f9; padding: 8px 12px; text-align: left; }}
+        .digest td {{ padding: 8px 12px; border-bottom: 1px solid #e2e8f0; }}
         .footer {{ text-align: center; padding: 2rem; color: #6c757d; font-size: 0.9rem; line-height: 1.6; }}
         h2 {{ color: #002B5C; margin: 2rem 0 1rem 0; }}
     </style>
@@ -626,7 +743,7 @@ def _build_report_html(
         
         <div class="digest">
             <h2>Standup Digest</h2>
-            <div>{standup_html}</div>
+            <div style="font-size: 14px; line-height: 1.7; color: #1e293b;">{standup_html}</div>
         </div>
     </div>
     <div class="footer">
@@ -638,8 +755,12 @@ def _build_report_html(
 </html>'''
 
 
-def _run_live_report(now: datetime) -> int:
-    """Run live report: scan repos, build HTML, open in browser."""
+def _run_live_report(now: datetime, open_browser: bool = True) -> int:
+    """Run live report: scan repos, build HTML, open in browser.
+
+    `open_browser=False` lets `live full` defer opening the report until after
+    the test comment has been posted, per its documented step order.
+    """
     import time
     start_time = time.time()
     
@@ -791,8 +912,106 @@ def _run_live_report(now: datetime) -> int:
     print(f"  Jira Discrepancies: {len(jira_discrepancies)}")
     print(f"  Scan Duration: {scan_duration:.1f}s")
     
-    # Open in browser
-    webbrowser.open(f"file://{os.path.abspath(output_path)}")
+    if open_browser:
+        webbrowser.open(f"file://{os.path.abspath(output_path)}")
+    return 0
+
+
+# Default shown in the printed setup instructions when TEST_ISSUE_NUMBER is unset —
+# update once a real demo issue exists in the target repo.
+_TEST_ISSUE_NUMBER_DEFAULT = 2
+
+_TEST_POST_COMMENT_BODY = (
+    "👋 Scrum Master Agent — Test Post\n\n"
+    "This is a demonstration comment showing the agent's ability to detect "
+    "stalled work and notify assignees.\n\n"
+    "In production this comment would appear when a story has had no commit "
+    "activity for 2+ business days.\n\n"
+    f"{AGENT_COMMENT_MARKER}"
+)
+
+
+def _post_test_comment() -> tuple[int, Optional[str]]:
+    """Post one real (non-dry-run) comment to a real GitHub issue.
+
+    Entirely env-driven so nothing about the target repo/issue is hardcoded:
+      TEST_REPO          e.g. "Aarnav-Gopinath/ScrumMasterAgent"
+      TEST_ISSUE_NUMBER  the issue number to comment on
+      GITHUB_TOKEN       must have permission to comment on that repo/issue
+
+    Returns (exit_code, comment_url) — shared by `test-post` and `live full`,
+    the latter needing the URL for its final summary line.
+    """
+    load_dotenv()
+
+    test_repo = os.environ.get("TEST_REPO")
+    if not test_repo:
+        print(
+            "TEST_REPO not set.\n\n"
+            "Set it to the repo you want to post a real test comment to, then "
+            "re-run, e.g.:\n"
+            "  export TEST_REPO=Aarnav-Gopinath/ScrumMasterAgent\n"
+            f"  export TEST_ISSUE_NUMBER={_TEST_ISSUE_NUMBER_DEFAULT}\n"
+            "  python -m agent.demo test-post"
+        )
+        return 1, None
+
+    test_issue_raw = os.environ.get("TEST_ISSUE_NUMBER")
+    if not test_issue_raw:
+        print(
+            "TEST_ISSUE_NUMBER not set.\n\n"
+            "Set it to the issue number to post the test comment on, then re-run, "
+            "e.g.:\n"
+            f"  export TEST_REPO={test_repo}\n"
+            f"  export TEST_ISSUE_NUMBER={_TEST_ISSUE_NUMBER_DEFAULT}\n"
+            "  python -m agent.demo test-post"
+        )
+        return 1, None
+
+    try:
+        test_issue_number = int(test_issue_raw)
+    except ValueError:
+        print(f"TEST_ISSUE_NUMBER must be an integer, got: {test_issue_raw!r}")
+        return 1, None
+
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        print("GITHUB_TOKEN required for test-post")
+        return 1, None
+
+    client = GitHubClient.from_token(test_repo, token=token)
+    issue = client.get_issue(test_issue_number)
+    print(f"Fetched issue #{test_issue_number}: {issue.title}")
+
+    comment = client.post_comment(test_issue_number, _TEST_POST_COMMENT_BODY)
+
+    print(f"Comment URL: {comment.html_url}")
+    print("✓ Comment posted successfully — open the issue to see it live")
+    return 0, comment.html_url
+
+
+def _run_test_post() -> int:
+    exit_code, _comment_url = _post_test_comment()
+    return exit_code
+
+
+def _run_live_full(now: datetime) -> int:
+    """Run the full demo end-to-end: live report scan, then a real test comment,
+    then open the report — so a viewer sees the report and the live comment
+    land in the same pass."""
+    print("Step 1/2 — Generating live report...")
+    report_exit = _run_live_report(now, open_browser=False)
+    if report_exit != 0:
+        return report_exit
+
+    print("\nStep 2/2 — Posting demo comment...")
+    post_exit, comment_url = _post_test_comment()
+    if post_exit != 0:
+        return post_exit
+
+    webbrowser.open(f"file://{os.path.abspath('demo-report.html')}")
+
+    print(f"\n✓ Demo complete — report open in browser, comment posted at: {comment_url}")
     return 0
 
 
@@ -806,19 +1025,28 @@ MODES = {
 
 
 def main(argv: list[str]) -> int:
+    if len(argv) >= 1 and argv[0] == "test-post":
+        return _run_test_post()
+
     if len(argv) >= 2 and argv[0] == "live":
         live_mode = argv[1]
         if live_mode == "report":
             now = datetime.now(timezone.utc)
             return _run_live_report(now)
+        if live_mode == "full":
+            now = datetime.now(timezone.utc)
+            return _run_live_full(now)
         if live_mode not in {"staleness", "standup", "pr_watcher", "completion"}:
-            print("usage: python -m agent.demo live <staleness|standup|pr_watcher|completion|report>")
+            print(
+                "usage: python -m agent.demo live "
+                "<staleness|standup|pr_watcher|completion|report|full>"
+            )
             return 2
         now = datetime.now(timezone.utc)
         return _run_live_mode(live_mode, now)
 
     if len(argv) < 1 or argv[0] not in MODES:
-        print(f"usage: python -m agent.demo <{'|'.join(MODES)}>")
+        print(f"usage: python -m agent.demo <{'|'.join(MODES)}|test-post>")
         return 2
     now = datetime.now(timezone.utc)
     MODES[argv[0]](now)
